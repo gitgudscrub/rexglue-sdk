@@ -320,6 +320,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   // clearing and stopping capturing. Returns whether the submission was done
   // successfully, if it has failed, leaves it open.
   bool EndSubmission(bool is_swap);
+  // Makes sure command_allocator_writable_first_ exists, creating one if none
+  // is free. Returns false if creation failed.
+  bool EnsureWritableCommandAllocator();
   // Checks if ending a submission right now would not cause potentially more
   // delay than it would reduce by making the GPU start working earlier - such
   // as when there are unfinished graphics pipeline creation requests that would

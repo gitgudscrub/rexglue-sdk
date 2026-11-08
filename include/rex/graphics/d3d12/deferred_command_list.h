@@ -12,8 +12,12 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #include <rex/assert.h>
@@ -31,9 +35,41 @@ class DeferredCommandList {
  public:
   DeferredCommandList(const D3D12CommandProcessor& command_processor,
                       size_t initial_size_bytes = 1_MiB);
+  ~DeferredCommandList();
 
   void Reset();
   void Execute(ID3D12GraphicsCommandList* command_list, ID3D12GraphicsCommandList1* command_list_1);
+
+  // Threaded recording (Fable 2 fork): a worker thread replays the commands
+  // into the real command list while the GPU thread keeps writing, instead of
+  // the whole list being replayed on the GPU thread at the end of the
+  // submission. The producer makes complete commands visible with Publish();
+  // EndThreadedRecording() publishes the rest and waits until all of it has
+  // been recorded, after which the command list can be closed and executed.
+  void StartRecordingThread();
+  void StopRecordingThread();
+  bool IsRecordingThreadRunning() const { return recording_thread_.joinable(); }
+  // Call right after Reset(), with the command list reset and open.
+  // The recording thread resets the allocator and the command list itself
+  // before replaying the first command of the session.
+  void BeginThreadedRecording(ID3D12GraphicsCommandList* command_list,
+                              ID3D12GraphicsCommandList1* command_list_1,
+                              ID3D12CommandAllocator* command_allocator);
+  bool IsThreadedRecordingActive() const { return threaded_list_ != nullptr; }
+  // Handoffs are batched: commands are only made visible to the recording
+  // thread once at least publish_batch_elements_ have accumulated since the
+  // last handoff (each handoff is a cross-core signal, too costly per draw).
+  // 0 publishes on every call. The rest is always published at the end.
+  void SetPublishBatchBytes(size_t bytes) { publish_batch_elements_ = bytes / sizeof(uintmax_t); }
+  void Publish() {
+    if (threaded_list_ != nullptr &&
+        threaded_session_start_ + command_stream_.size() -
+                published_position_.load(std::memory_order_relaxed) >=
+            publish_batch_elements_) {
+      PublishThreaded();
+    }
+  }
+  void EndThreadedRecording();
 
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
@@ -640,10 +676,43 @@ class DeferredCommandList {
 
   void* WriteCommand(Command command, size_t arguments_size_bytes);
 
+  void ExecuteRange(ID3D12GraphicsCommandList* command_list,
+                    ID3D12GraphicsCommandList1* command_list_1, const uintmax_t* stream,
+                    size_t stream_remaining, ID3D12PipelineState*& current_pipeline_state) const;
+  void PublishThreaded();
+  void WaitUntilRecorded(size_t target);
+  void RecordingThreadMain();
+
   const D3D12CommandProcessor& command_processor_;
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+
+  // Threaded recording. Positions are absolute (they never go back), in
+  // uintmax_t elements: the stream offset of a command is its position minus
+  // threaded_session_start_, so nothing has to be reset while the worker may be
+  // polling. The worker reads command_stream_ through published_data_ only up
+  // to published_position_; command_stream_ is never reallocated while the
+  // worker may be reading it (WriteCommand waits for it to catch up first).
+  // The worker resets, records and closes the command list itself - the driver
+  // needs the list closed on the thread that recorded it.
+  std::thread recording_thread_;
+  ID3D12GraphicsCommandList* threaded_list_ = nullptr;
+  ID3D12GraphicsCommandList1* threaded_list_1_ = nullptr;
+  ID3D12PipelineState* threaded_pipeline_state_ = nullptr;
+  ID3D12CommandAllocator* threaded_allocator_ = nullptr;
+  bool threaded_list_reset_ = false;  // touched by the recording thread only
+  size_t threaded_session_start_ = 0;
+  size_t publish_batch_elements_ = 0;
+  std::atomic<const uintmax_t*> published_data_{nullptr};
+  std::atomic<size_t> published_position_{0};
+  std::atomic<size_t> recorded_position_{0};
+  std::atomic<bool> recording_thread_sleeping_{false};
+  std::atomic<bool> recording_thread_stop_{false};
+  std::atomic<bool> close_requested_{false};
+  std::atomic<bool> close_done_{false};
+  std::mutex recording_mutex_;
+  std::condition_variable recording_cond_;
 };
 
 }  // namespace rex::graphics::d3d12

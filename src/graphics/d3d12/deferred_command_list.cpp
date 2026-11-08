@@ -16,6 +16,8 @@
 #include <rex/graphics/flags.h>
 #include <rex/math.h>
 
+#include <immintrin.h>
+
 namespace rex::graphics::d3d12 {
 
 DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_processor,
@@ -24,7 +26,12 @@ DeferredCommandList::DeferredCommandList(const D3D12CommandProcessor& command_pr
   command_stream_.reserve(initial_size / sizeof(uintmax_t));
 }
 
+DeferredCommandList::~DeferredCommandList() {
+  StopRecordingThread();
+}
+
 void DeferredCommandList::Reset() {
+  assert_null(threaded_list_);
   command_stream_.clear();
 }
 
@@ -33,9 +40,162 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
-  const uintmax_t* stream = command_stream_.data();
-  size_t stream_remaining = command_stream_.size();
   ID3D12PipelineState* current_pipeline_state = nullptr;
+  ExecuteRange(command_list, command_list_1, command_stream_.data(), command_stream_.size(),
+               current_pipeline_state);
+}
+
+void DeferredCommandList::StartRecordingThread() {
+  if (recording_thread_.joinable()) {
+    return;
+  }
+  recording_thread_stop_.store(false);
+  recording_thread_ = std::thread([this]() { RecordingThreadMain(); });
+}
+
+void DeferredCommandList::StopRecordingThread() {
+  if (!recording_thread_.joinable()) {
+    return;
+  }
+  {
+    std::lock_guard<std::mutex> lock(recording_mutex_);
+    recording_thread_stop_.store(true);
+  }
+  recording_cond_.notify_all();
+  recording_thread_.join();
+  threaded_list_ = nullptr;
+  threaded_list_1_ = nullptr;
+}
+
+void DeferredCommandList::BeginThreadedRecording(ID3D12GraphicsCommandList* command_list,
+                                                 ID3D12GraphicsCommandList1* command_list_1,
+                                                 ID3D12CommandAllocator* command_allocator) {
+  assert_true(recording_thread_.joinable());
+  assert_true(command_stream_.empty());
+  // The worker is idle here: everything published so far has been recorded
+  // and the previous list closed (EndThreadedRecording waited for both), and it
+  // won't look at the new session's fields until the first PublishThreaded()
+  // or close request.
+  threaded_list_ = command_list;
+  threaded_list_1_ = command_list_1;
+  threaded_allocator_ = command_allocator;
+  threaded_list_reset_ = false;
+  threaded_pipeline_state_ = nullptr;
+  threaded_session_start_ = published_position_.load(std::memory_order_relaxed);
+}
+
+void DeferredCommandList::PublishThreaded() {
+  size_t position = threaded_session_start_ + command_stream_.size();
+  if (position == published_position_.load(std::memory_order_relaxed)) {
+    return;
+  }
+  published_data_.store(command_stream_.data(), std::memory_order_relaxed);
+  // seq_cst pairs with the worker's seq_cst store of recording_thread_sleeping_
+  // followed by its load of published_position_, so a wake-up isn't lost.
+  published_position_.store(position, std::memory_order_seq_cst);
+  if (recording_thread_sleeping_.load(std::memory_order_seq_cst)) {
+    std::lock_guard<std::mutex> lock(recording_mutex_);
+    recording_cond_.notify_one();
+  }
+}
+
+template <typename Predicate>
+static void SpinWait(Predicate done) {
+  uint32_t spins = 0;
+  while (!done()) {
+    if (++spins < 4096) {
+      _mm_pause();
+    } else {
+      std::this_thread::yield();
+    }
+  }
+}
+
+void DeferredCommandList::WaitUntilRecorded(size_t target) {
+  SpinWait([&]() { return recorded_position_.load(std::memory_order_acquire) == target; });
+}
+
+void DeferredCommandList::EndThreadedRecording() {
+  assert_not_null(threaded_list_);
+  PublishThreaded();
+  WaitUntilRecorded(published_position_.load(std::memory_order_relaxed));
+  // The list must be closed on the thread that recorded it: closing it on the
+  // GPU command thread instead left the NVIDIA driver's command buffer
+  // incomplete, and the GPU hung (DEVICE_HUNG) within seconds of booting.
+  close_done_.store(false, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(recording_mutex_);
+    close_requested_.store(true, std::memory_order_seq_cst);
+  }
+  recording_cond_.notify_one();
+  SpinWait([&]() { return close_done_.load(std::memory_order_acquire); });
+  threaded_list_ = nullptr;
+  threaded_list_1_ = nullptr;
+}
+
+void DeferredCommandList::RecordingThreadMain() {
+#ifdef _WIN32
+  SetThreadDescription(GetCurrentThread(), L"D3D12 Command Recorder");
+#endif
+  for (;;) {
+    size_t end = published_position_.load(std::memory_order_acquire);
+    size_t begin = recorded_position_.load(std::memory_order_relaxed);
+    if (end != begin) {
+      if (!threaded_list_reset_) {
+        // Reset, record and close all on this thread.
+        threaded_list_reset_ = true;
+        threaded_allocator_->Reset();
+        threaded_list_->Reset(threaded_allocator_, nullptr);
+      }
+      const uintmax_t* data = published_data_.load(std::memory_order_relaxed);
+      ExecuteRange(threaded_list_, threaded_list_1_, data + (begin - threaded_session_start_),
+                   end - begin, threaded_pipeline_state_);
+      recorded_position_.store(end, std::memory_order_release);
+      continue;
+    }
+    if (close_requested_.load(std::memory_order_acquire)) {
+      if (!threaded_list_reset_) {
+        // Nothing was recorded this session - open the list so it can be closed.
+        threaded_list_reset_ = true;
+        threaded_allocator_->Reset();
+        threaded_list_->Reset(threaded_allocator_, nullptr);
+      }
+      threaded_list_->Close();
+      close_requested_.store(false, std::memory_order_relaxed);
+      close_done_.store(true, std::memory_order_release);
+      continue;
+    }
+    if (recording_thread_stop_.load(std::memory_order_relaxed)) {
+      return;
+    }
+    // Draws come in quick succession, so poll briefly before sleeping.
+    bool work = false;
+    for (uint32_t i = 0; i < 2048; ++i) {
+      _mm_pause();
+      if (published_position_.load(std::memory_order_relaxed) != begin ||
+          close_requested_.load(std::memory_order_relaxed)) {
+        work = true;
+        break;
+      }
+    }
+    if (work) {
+      continue;
+    }
+    std::unique_lock<std::mutex> lock(recording_mutex_);
+    recording_thread_sleeping_.store(true, std::memory_order_seq_cst);
+    recording_cond_.wait(lock, [&]() {
+      return published_position_.load(std::memory_order_seq_cst) != begin ||
+             close_requested_.load(std::memory_order_seq_cst) ||
+             recording_thread_stop_.load(std::memory_order_relaxed);
+    });
+    recording_thread_sleeping_.store(false, std::memory_order_relaxed);
+  }
+}
+
+void DeferredCommandList::ExecuteRange(ID3D12GraphicsCommandList* command_list,
+                                       ID3D12GraphicsCommandList1* command_list_1,
+                                       const uintmax_t* stream, size_t stream_remaining,
+                                       ID3D12PipelineState*& current_pipeline_state) const {
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -281,7 +441,16 @@ void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_b
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
   size_t offset = command_stream_.size();
-  command_stream_.resize(offset + kCommandHeaderSizeElements + arguments_size_elements);
+  size_t new_size = offset + kCommandHeaderSizeElements + arguments_size_elements;
+  if (threaded_list_ != nullptr && new_size > command_stream_.capacity()) {
+    // Growing reallocates the stream, which the recording thread may be
+    // reading - let it record everything written so far (all of it complete,
+    // the new command hasn't been written yet), then grow.
+    PublishThreaded();
+    WaitUntilRecorded(published_position_.load(std::memory_order_relaxed));
+    command_stream_.reserve(std::max(new_size, command_stream_.capacity() * 2));
+  }
+  command_stream_.resize(new_size);
   CommandHeader& header = *reinterpret_cast<CommandHeader*>(command_stream_.data() + offset);
   header.command = command;
   header.arguments_size_elements = uint32_t(arguments_size_elements);

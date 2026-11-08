@@ -65,6 +65,18 @@ REXCVAR_DEFINE_BOOL(d3d12_submit_on_primary_buffer_end, true, "GPU/D3D12",
                     "Submit command list when PM4 primary buffer ends")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(d3d12_threaded_command_recording, true, "GPU/D3D12",
+                    "Record the D3D12 command list on a separate thread while the GPU "
+                    "command thread processes the following draws, instead of replaying "
+                    "the whole submission on the GPU command thread when it ends")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_INT32(d3d12_threaded_command_recording_batch_kb, 8, "GPU/D3D12",
+                     "With d3d12_threaded_command_recording, hand commands to the recording "
+                     "thread once this many KB have accumulated (0 = after every draw)")
+    .range(0, 1024)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
@@ -923,6 +935,13 @@ bool D3D12CommandProcessor::SetupContext() {
   command_list_->Close();
   // Optional - added in Creators Update (SDK 10.0.15063.0).
   command_list_->QueryInterface(IID_PPV_ARGS(&command_list_1_));
+  if (REXCVAR_GET(d3d12_threaded_command_recording)) {
+    deferred_command_list_.SetPublishBatchBytes(
+        size_t(REXCVAR_GET(d3d12_threaded_command_recording_batch_kb)) * 1024);
+    deferred_command_list_.StartRecordingThread();
+    REXGPU_INFO("D3D12 command list recording runs on a separate thread (batch {} KB)",
+                REXCVAR_GET(d3d12_threaded_command_recording_batch_kb));
+  }
 
   bindless_resources_used_ = REXCVAR_GET(d3d12_bindless) &&
                              provider.GetResourceBindingTier() >= D3D12_RESOURCE_BINDING_TIER_2;
@@ -1646,6 +1665,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  deferred_command_list_.StopRecordingThread();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
@@ -2783,6 +2803,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }
   }
+  // Hand the draw (and everything before it) to the recording thread.
+  deferred_command_list_.Publish();
 
   if (memexport_used) {
     // Make sure this memexporting draw is ordered with other work using shared
@@ -3328,12 +3350,21 @@ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HR
   if (SUCCEEDED(dred->GetAutoBreadcrumbsOutput(&breadcrumbs))) {
     for (const D3D12_AUTO_BREADCRUMB_NODE* node = breadcrumbs.pHeadAutoBreadcrumbNode; node;
          node = node->pNext) {
-      if (!node->pLastBreadcrumbValue || !node->pCommandHistory ||
-          *node->pLastBreadcrumbValue == 0) {
+      if (!node->pLastBreadcrumbValue || !node->pCommandHistory) {
         continue;
       }
-      REXGPU_ERROR("DRED breadcrumb: completed {} of {} ops", *node->pLastBreadcrumbValue,
-                   node->BreadcrumbCount);
+      // Report every list the GPU didn't finish, including ones that hung on
+      // their first operation (completed 0).
+      if (*node->pLastBreadcrumbValue == 0 && node->BreadcrumbCount == 0) {
+        continue;
+      }
+      if (*node->pLastBreadcrumbValue >= node->BreadcrumbCount) {
+        continue;
+      }
+      REXGPU_ERROR("DRED breadcrumb: completed {} of {} ops (queue {}, list {})",
+                   *node->pLastBreadcrumbValue, node->BreadcrumbCount,
+                   node->pCommandQueueDebugNameA ? node->pCommandQueueDebugNameA : "?",
+                   node->pCommandListDebugNameA ? node->pCommandListDebugNameA : "?");
       uint32_t last = std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
       uint32_t start = last > 3 ? last - 3 : 0;
       uint32_t end = std::min(last + 1, node->BreadcrumbCount);
@@ -3405,6 +3436,17 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     // end of the submission (when async pipeline creation requests are
     // fulfilled).
     deferred_command_list_.Reset();
+    // With threaded recording, the recording thread replays the commands into
+    // the real command list as they're published, instead of all of them being
+    // replayed here when the submission ends. Draws are only written once their
+    // pipeline exists (IssueDraw waits for it or skips the draw), so replaying
+    // early resolves the same pipelines.
+    if (deferred_command_list_.IsRecordingThreadRunning() && EnsureWritableCommandAllocator()) {
+      // The recording thread resets this allocator and the command list itself
+      // before replaying the first command, and closes the list at the end.
+      deferred_command_list_.BeginThreadedRecording(
+          command_list_, command_list_1_, command_allocator_writable_first_->command_allocator);
+    }
 
     // Reset cached state of the command list.
     ff_viewport_update_needed_ = true;
@@ -3474,24 +3516,32 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   return true;
 }
 
+bool D3D12CommandProcessor::EnsureWritableCommandAllocator() {
+  if (command_allocator_writable_first_) {
+    return true;
+  }
+  ID3D12CommandAllocator* command_allocator;
+  if (FAILED(GetD3D12Provider().GetDevice()->CreateCommandAllocator(
+          D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&command_allocator)))) {
+    REXGPU_ERROR("Failed to create a command allocator");
+    return false;
+  }
+  command_allocator_writable_first_ = new CommandAllocator;
+  command_allocator_writable_first_->command_allocator = command_allocator;
+  command_allocator_writable_first_->last_usage_submission = 0;
+  command_allocator_writable_first_->next = nullptr;
+  command_allocator_writable_last_ = command_allocator_writable_first_;
+  return true;
+}
+
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
 
   // Make sure there is a command allocator to write commands to.
-  if (submission_open_ && !command_allocator_writable_first_) {
-    ID3D12CommandAllocator* command_allocator;
-    if (FAILED(provider.GetDevice()->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                            IID_PPV_ARGS(&command_allocator)))) {
-      REXGPU_ERROR("Failed to create a command allocator");
-      // Try to submit later. Completely dropping the submission is not
-      // permitted because resources would be left in an undefined state.
-      return false;
-    }
-    command_allocator_writable_first_ = new CommandAllocator;
-    command_allocator_writable_first_->command_allocator = command_allocator;
-    command_allocator_writable_first_->last_usage_submission = 0;
-    command_allocator_writable_first_->next = nullptr;
-    command_allocator_writable_last_ = command_allocator_writable_first_;
+  if (submission_open_ && !EnsureWritableCommandAllocator()) {
+    // Try to submit later. Completely dropping the submission is not
+    // permitted because resources would be left in an undefined state.
+    return false;
   }
 
   bool is_closing_frame = is_swap && frame_open_;
@@ -3524,12 +3574,19 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
     // ExecuteCommandLists - the boundaries of ExecuteCommandLists are a full
     // UAV and aliasing barrier, and subsystems of the emulator assume it
     // happens between Xenia submissions.
-    ID3D12CommandAllocator* command_allocator =
-        command_allocator_writable_first_->command_allocator;
-    command_allocator->Reset();
-    command_list_->Reset(command_allocator, nullptr);
-    deferred_command_list_.Execute(command_list_, command_list_1_);
-    command_list_->Close();
+    if (deferred_command_list_.IsThreadedRecordingActive()) {
+      // Recorded on the recording thread with the allocator that was the first
+      // writable one when the submission was opened, which is still first
+      // (completed allocators are only appended to the writable list).
+      deferred_command_list_.EndThreadedRecording();
+    } else {
+      ID3D12CommandAllocator* command_allocator =
+          command_allocator_writable_first_->command_allocator;
+      command_allocator->Reset();
+      command_list_->Reset(command_allocator, nullptr);
+      deferred_command_list_.Execute(command_list_, command_list_1_);
+      command_list_->Close();
+    }
     ID3D12CommandList* execute_command_lists[] = {command_list_};
     direct_queue->ExecuteCommandLists(1, execute_command_lists);
     command_allocator_writable_first_->last_usage_submission = submission_current_;

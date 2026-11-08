@@ -62,6 +62,31 @@ REXCVAR_DEFINE_INT32(d3d12_pipeline_creation_threads, -1, "GPU/D3D12",
     .range(-1, 32)
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(d3d12_log_pipeline_timing, false, "GPU/D3D12",
+                    "Log shader translations, pipeline creations and draw waits for a "
+                    "pipeline that take 1 ms or more ([pipeline-timing] lines)");
+
+namespace {
+// Logs how long its scope took when d3d12_log_pipeline_timing is on.
+struct PipelineTimer {
+  const char* what;
+  uint64_t id;
+  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+  PipelineTimer(const char* what_in, uint64_t id_in) : what(what_in), id(id_in) {}
+  ~PipelineTimer() {
+    if (!REXCVAR_GET(d3d12_log_pipeline_timing)) {
+      return;
+    }
+    double ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start)
+            .count();
+    if (ms >= 1.0) {
+      REXGPU_INFO("[pipeline-timing] {} {:016X} {:.1f} ms", what, id, ms);
+    }
+  }
+};
+}  // namespace
+
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
@@ -1073,6 +1098,8 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                             IDxbcConverter* dxbc_converter, IDxcUtils* dxc_utils,
                                             IDxcCompiler* dxc_compiler) {
   D3D12Shader& shader = static_cast<D3D12Shader&>(translation.shader());
+  PipelineTimer timer(shader.type() == xenos::ShaderType::kVertex ? "translate VS" : "translate PS",
+                      shader.ucode_data_hash());
 
   // Perform translation.
   // If this fails the shader will be marked as invalid and ignored later.
@@ -2697,6 +2724,8 @@ const std::vector<uint32_t>& PipelineCache::GetGeometryShader(GeometryShaderKey 
 ID3D12PipelineState* PipelineCache::CreateD3D12Pipeline(
     const PipelineRuntimeDescription& runtime_description) {
   const PipelineDescription& description = runtime_description.description;
+  PipelineTimer timer("create pipeline VS",
+                      runtime_description.vertex_shader->shader().ucode_data_hash());
 
   if (runtime_description.pixel_shader != nullptr) {
     REXGPU_DEBUG("Creating graphics pipeline with VS {:016X}, PS {:016X}",
@@ -3292,6 +3321,7 @@ bool PipelineCache::WaitForPipeline(void* handle, uint32_t timeout_ms) {
   if (creation_threads_.empty()) {
     return false;
   }
+  PipelineTimer timer("draw waited for pipeline", uint64_t(reinterpret_cast<uintptr_t>(handle)));
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
   // Help creating the queued pipelines (highest priority first) until the needed

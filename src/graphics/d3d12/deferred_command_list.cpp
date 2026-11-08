@@ -42,7 +42,7 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
   ID3D12PipelineState* current_pipeline_state = nullptr;
   ExecuteRange(command_list, command_list_1, command_stream_.data(), command_stream_.size(),
-               current_pipeline_state);
+               current_pipeline_state, false);
 }
 
 void DeferredCommandList::StartRecordingThread() {
@@ -149,7 +149,7 @@ void DeferredCommandList::RecordingThreadMain() {
       }
       const uintmax_t* data = published_data_.load(std::memory_order_relaxed);
       ExecuteRange(threaded_list_, threaded_list_1_, data + (begin - threaded_session_start_),
-                   end - begin, threaded_pipeline_state_);
+                   end - begin, threaded_pipeline_state_, true);
       recorded_position_.store(end, std::memory_order_release);
       continue;
     }
@@ -195,7 +195,8 @@ void DeferredCommandList::RecordingThreadMain() {
 void DeferredCommandList::ExecuteRange(ID3D12GraphicsCommandList* command_list,
                                        ID3D12GraphicsCommandList1* command_list_1,
                                        const uintmax_t* stream, size_t stream_remaining,
-                                       ID3D12PipelineState*& current_pipeline_state) const {
+                                       ID3D12PipelineState*& current_pipeline_state,
+                                       bool wait_for_pipelines) const {
   while (stream_remaining != 0) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
@@ -397,8 +398,14 @@ void DeferredCommandList::ExecuteRange(ID3D12GraphicsCommandList* command_list,
         }
       } break;
       case Command::kSetPipelineStateHandle: {
-        current_pipeline_state =
-            command_processor_.GetD3D12PipelineByHandle(*reinterpret_cast<void* const*>(stream));
+        void* pipeline_handle = *reinterpret_cast<void* const*>(stream);
+        current_pipeline_state = command_processor_.GetD3D12PipelineByHandle(pipeline_handle);
+        // On the recording thread, a pipeline still being created is waited for
+        // here, so the GPU command thread can go on queueing other new pipelines.
+        if (current_pipeline_state == nullptr && wait_for_pipelines &&
+            command_processor_.WaitForPipelineDuringReplay(pipeline_handle)) {
+          current_pipeline_state = command_processor_.GetD3D12PipelineByHandle(pipeline_handle);
+        }
         if (current_pipeline_state) {
           command_list->SetPipelineState(current_pipeline_state);
         }

@@ -60,6 +60,8 @@ class DeferredCommandList {
   // thread once at least publish_batch_elements_ have accumulated since the
   // last handoff (each handoff is a cross-core signal, too costly per draw).
   // 0 publishes on every call. The rest is always published at the end.
+  // Whether this submission is being recorded by the recording thread.
+  bool IsThreadedRecording() const { return threaded_list_ != nullptr; }
   void SetPublishBatchBytes(size_t bytes) { publish_batch_elements_ = bytes / sizeof(uintmax_t); }
   void Publish() {
     if (threaded_list_ != nullptr &&
@@ -678,7 +680,8 @@ class DeferredCommandList {
 
   void ExecuteRange(ID3D12GraphicsCommandList* command_list,
                     ID3D12GraphicsCommandList1* command_list_1, const uintmax_t* stream,
-                    size_t stream_remaining, ID3D12PipelineState*& current_pipeline_state) const;
+                    size_t stream_remaining, ID3D12PipelineState*& current_pipeline_state,
+                    bool wait_for_pipelines) const;
   void PublishThreaded();
   void WaitUntilRecorded(size_t target);
   void RecordingThreadMain();

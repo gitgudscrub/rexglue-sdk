@@ -182,6 +182,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   ID3D12PipelineState* GetD3D12PipelineByHandle(void* handle) const {
     return pipeline_cache_->GetD3D12PipelineByHandle(handle);
   }
+  // Called by the command recording thread when it replays a pipeline that is
+  // still being created. Returns whether the pipeline exists now.
+  bool WaitForPipelineDuringReplay(void* handle) const;
 
   // Sets the current cached values to external ones. This is for cache
   // invalidation primarily. A submission must be open.

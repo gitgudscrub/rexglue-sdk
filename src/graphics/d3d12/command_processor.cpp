@@ -71,6 +71,10 @@ REXCVAR_DEFINE_BOOL(d3d12_threaded_command_recording, true, "GPU/D3D12",
                     "the whole submission on the GPU command thread when it ends")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
+REXCVAR_DEFINE_BOOL(d3d12_threaded_pipeline_wait, true, "GPU/D3D12",
+                    "With d3d12_threaded_command_recording, wait for pipelines still being "
+                    "created on the recording thread instead of the GPU command thread, so "
+                    "new pipelines are created in parallel");
 REXCVAR_DEFINE_INT32(d3d12_threaded_command_recording_batch_kb, 8, "GPU/D3D12",
                      "With d3d12_threaded_command_recording, hand commands to the recording "
                      "thread once this many KB have accumulated (0 = after every draw)")
@@ -2352,6 +2356,12 @@ bool IsDepthClearRectangle(const RegisterFile& regs, const memory::Memory& memor
 
 }  // namespace
 
+bool D3D12CommandProcessor::WaitForPipelineDuringReplay(void* handle) const {
+  return REXCVAR_GET(async_pipeline_wait) &&
+         pipeline_cache_->WaitForPipeline(
+             handle, uint32_t(std::max(100, REXCVAR_GET(async_pipeline_wait_timeout_ms))));
+}
+
 bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                                       IndexBufferInfo* index_buffer_info,
                                       bool major_mode_explicit) {
@@ -2500,7 +2510,11 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
     return false;
   }
-  if (REXCVAR_GET(async_shader_compilation) &&
+  // With threaded recording, the recording thread waits for the pipeline when
+  // it replays the draw, so new pipelines found in the rest of the submission
+  // are created in parallel instead of one after another on this thread.
+  if (REXCVAR_GET(async_shader_compilation) && !(deferred_command_list_.IsThreadedRecording() &&
+        REXCVAR_GET(d3d12_threaded_pipeline_wait)) &&
       pipeline_cache_->GetD3D12PipelineByHandle(pipeline_handle) == nullptr) {
     // Skipping the draw leaves objects missing for that frame and corrupts any
     // texture rendered by the skipped pass, so wait for the pipeline instead.

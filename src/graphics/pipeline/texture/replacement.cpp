@@ -466,13 +466,13 @@ class TextureReplacer::DumpWorker {
     thread_.join();
   }
 
-  // Returns false if the queue is full (the job is dropped).
+  // Waits while the queue is full: a texture whose dump is dropped might
+  // never be loaded again, and dumping is a collection mode where a short
+  // stall is fine.
   bool Push(DumpJob&& job) {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (jobs_.size() >= 512) {
-        return false;
-      }
+      std::unique_lock<std::mutex> lock(mutex_);
+      space_cv_.wait(lock, [this] { return jobs_.size() < 512; });
       jobs_.push_back(std::move(job));
     }
     cv_.notify_one();
@@ -492,6 +492,7 @@ class TextureReplacer::DumpWorker {
         job = std::move(jobs_.front());
         jobs_.pop_front();
       }
+      space_cv_.notify_one();
       if (!WriteDds(job.path, job.format, job.width, job.height, job.data)) {
         REXGPU_WARN("Texture dump: failed to write {}", rex::path_to_utf8(job.path));
       }
@@ -500,6 +501,7 @@ class TextureReplacer::DumpWorker {
 
   std::mutex mutex_;
   std::condition_variable cv_;
+  std::condition_variable space_cv_;
   std::deque<DumpJob> jobs_;
   bool stop_ = false;
   std::thread thread_;

@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -22,6 +23,7 @@
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/d3d12/shared_memory.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/graphics/pipeline/texture/replacement.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
@@ -40,6 +42,10 @@ class D3D12TextureCache final : public TextureCache {
     TextureKey key;
     uint32_t host_swizzle;
     uint8_t swizzled_signs;
+    // The descriptors themselves, since a texture replacement (or toggling
+    // replacements) changes them without changing the key.
+    uint32_t descriptor_index;
+    uint32_t descriptor_index_signed;
   };
 
   // Sampler parameters that can be directly converted to a host sampler or used
@@ -86,6 +92,7 @@ class D3D12TextureCache final : public TextureCache {
 
   void ClearCache() override;
 
+  void CompletedSubmissionUpdated(uint64_t completed_submission_index) override;
   void BeginSubmission(uint64_t new_submission_index) override;
   void BeginFrame() override;
   void EndFrame();
@@ -179,6 +186,7 @@ class D3D12TextureCache final : public TextureCache {
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
  private:
+
   static constexpr uint32_t kLoadGuestXThreadsPerGroupLog2 = 2;
   static constexpr uint32_t kLoadGuestYBlocksPerGroupLog2 = 5;
 
@@ -267,6 +275,31 @@ class D3D12TextureCache final : public TextureCache {
     void AddSRVDescriptorIndex(SRVDescriptorKey descriptor_key, uint32_t descriptor_index) {
       srv_descriptors_.emplace(descriptor_key, descriptor_index);
     }
+
+    // Texture pack state (see texture_replacement). Managed by the cache.
+    struct Replacement {
+      // Content hash of the base level when it was last loaded.
+      uint64_t content_hash = 0;
+      bool content_hash_valid = false;
+      // Content changes less than a second apart in a row; textures a video
+      // or the GPU keeps rewriting stop being hashed.
+      uint64_t last_change_time = 0;
+      uint32_t rapid_changes = 0;
+      // XXH3 of the raw (tiled, big-endian) guest base level, to skip
+      // untiling when a reload didn't change anything.
+      uint64_t raw_hash = 0;
+      // Reloads less than 100 ms apart in a row, and throttling state.
+      uint64_t last_load_time = 0;
+      uint64_t last_check_time = 0;
+      uint32_t quick_reloads = 0;
+      bool skip = false;
+      Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+      DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+      uint32_t mip_count = 0;
+      // Descriptors of the replacement resource, by host swizzle.
+      std::unordered_map<uint32_t, uint32_t> srv_descriptors;
+    };
+    Replacement replacement_;
 
    private:
     Microsoft::WRL::ComPtr<ID3D12Resource> resource_;
@@ -402,6 +435,17 @@ class D3D12TextureCache final : public TextureCache {
   // or UINT32_MAX if failed to create.
   uint32_t FindOrCreateTextureDescriptor(D3D12Texture& texture, xenos::DataDimension dimension,
                                          bool is_signed, uint32_t host_swizzle);
+  // Texture packs: hashes a texture after its base level was loaded, dumps it
+  // if enabled, and attaches or detaches its replacement.
+  void UpdateTextureReplacement(D3D12Texture& texture);
+  bool LoadTextureReplacement(D3D12Texture& texture, const std::filesystem::path& path);
+  // Releases the texture's replacement once the GPU is done with it.
+  void DropTextureReplacement(D3D12Texture& texture);
+  bool IsReplacementShown(const D3D12Texture& texture, xenos::DataDimension dimension,
+                          bool is_signed) const;
+  // A free non-shader-visible cached (bindful) or global bindless descriptor
+  // index, or UINT32_MAX.
+  uint32_t AllocateTextureDescriptor();
   void ReleaseTextureDescriptor(uint32_t descriptor_index);
   D3D12_CPU_DESCRIPTOR_HANDLE GetTextureDescriptorCPUHandle(uint32_t descriptor_index) const;
 
@@ -480,6 +524,19 @@ class D3D12TextureCache final : public TextureCache {
   D3D12_CPU_DESCRIPTOR_HANDLE null_srv_descriptor_heap_start_;
 
   std::array<D3D12TextureBinding, xenos::kTextureFetchConstantCount> d3d12_texture_bindings_;
+
+  texture_replacement::TextureReplacer texture_replacer_;
+  bool texture_replacer_initialized_ = false;
+  // Last seen value of the texture_replacement cvar.
+  bool replacement_shown_ = true;
+  // Replacement resources, upload buffers and descriptors waiting for the GPU
+  // to finish the submission that last could use them.
+  struct ReplacementGarbage {
+    uint64_t submission;
+    Microsoft::WRL::ComPtr<ID3D12Resource> resource;
+    std::vector<uint32_t> descriptors;
+  };
+  std::deque<ReplacementGarbage> replacement_garbage_;
 
   // Unsupported texture formats used during this frame (for research and
   // testing).

@@ -19,6 +19,7 @@
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/texture/cache.h>
+#include <rex/hash.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
@@ -645,7 +646,7 @@ void TextureCache::Texture::VerifyUpToDate(
   }
   SharedMemory& shared_memory = texture_cache_.shared_memory();
   uint32_t start = key_.base_page << 12;
-  uint64_t hash = XXH3_64bits(shared_memory.memory().TranslatePhysical(start), GetGuestBaseSize());
+  uint64_t hash = XXH3_64bits(shared_memory.TranslateGuestPhysical(start), GetGuestBaseSize());
   if (hash == verify_base_hash_) {
     return;
   }
@@ -753,7 +754,7 @@ void TextureCache::Texture::MakeUpToDateAndWatch(
       outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
       if (REXCVAR_GET(texture_cache_verify)) {
         verify_base_hash_ = XXH3_64bits(
-            shared_memory.memory().TranslatePhysical(key().base_page << 12), GetGuestBaseSize());
+            shared_memory.TranslateGuestPhysical(key().base_page << 12), GetGuestBaseSize());
         verify_base_hash_valid_ = true;
       }
     }

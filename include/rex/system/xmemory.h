@@ -323,6 +323,10 @@ class PhysicalHeap : public BaseHeap {
   uint32_t GetPhysicalAddress(uint32_t address) const;
 
  protected:
+  // Tells the invalidation callbacks (the GPU shared memory) that a newly
+  // allocated range may be written without faults, see the definition.
+  void InvalidateNewAllocation(uint32_t address, uint32_t size);
+
   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
 
   // Allocation on these heaps delegates to parent_heap_, whose own reconcile

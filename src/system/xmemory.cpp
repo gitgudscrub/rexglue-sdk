@@ -1901,9 +1901,10 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
-  // Global critical region before heap_mutex_ - see
-  // AcquireHostPageReconcileLock for why the order matters.
-  auto global_lock = AcquireHostPageReconcileLock();
+  // The global critical region (always, unlike AcquireHostPageReconcileLock)
+  // before heap_mutex_: InvalidateNewAllocation calls into the GPU shared
+  // memory, which takes it, and Release/Protect take it first as well.
+  auto global_lock = global_critical_region_.Acquire();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
@@ -1924,6 +1925,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
     // TODO(benvanik): don't leak parent memory.
     return false;
   }
+  InvalidateNewAllocation(address, size);
   *out_address = address;
   return true;
 }
@@ -1934,9 +1936,10 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
-  // Global critical region before heap_mutex_ - see
-  // AcquireHostPageReconcileLock for why the order matters.
-  auto global_lock = AcquireHostPageReconcileLock();
+  // The global critical region (always, unlike AcquireHostPageReconcileLock)
+  // before heap_mutex_: InvalidateNewAllocation calls into the GPU shared
+  // memory, which takes it, and Release/Protect take it first as well.
+  auto global_lock = global_critical_region_.Acquire();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
@@ -1957,6 +1960,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
     // TODO(benvanik): don't leak parent memory.
     return false;
   }
+  InvalidateNewAllocation(address, size);
 
   return true;
 }
@@ -1970,9 +1974,10 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
-  // Global critical region before heap_mutex_ - see
-  // AcquireHostPageReconcileLock for why the order matters.
-  auto global_lock = AcquireHostPageReconcileLock();
+  // The global critical region (always, unlike AcquireHostPageReconcileLock)
+  // before heap_mutex_: InvalidateNewAllocation calls into the GPU shared
+  // memory, which takes it, and Release/Protect take it first as well.
+  auto global_lock = global_critical_region_.Acquire();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
@@ -1995,6 +2000,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
     // TODO(benvanik): don't leak parent memory.
     return false;
   }
+  InvalidateNewAllocation(address, size);
   *out_address = address;
   return true;
 }
@@ -2002,6 +2008,26 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
 bool PhysicalHeap::AllocSystemHeap(uint32_t size, uint32_t alignment, uint32_t allocation_type,
                                    uint32_t protect, bool top_down, uint32_t* out_address) {
   return Alloc(size, alignment, allocation_type, protect, top_down, out_address);
+}
+
+void PhysicalHeap::InvalidateNewAllocation(uint32_t address, uint32_t size) {
+  // GPU shared memory may consider this range valid without any heap watching
+  // it: write watches are only installed on pages committed read/write in a
+  // heap, so a range the GPU read while it was free (between a release and
+  // this allocation, or through a texture left pointing at freed memory) stays
+  // valid but unprotected. The new owner's writes then never fault, and the
+  // GPU keeps using the old data - Bink video frame buffers reallocated for
+  // the next video showed this as corrupt frames. Release invalidates the old
+  // contents, but the GPU can read the range again before it is reused, so
+  // invalidate when memory becomes owned and writable as well. Exact range:
+  // nothing here needs to be unprotected.
+  if (!size) {
+    return;
+  }
+  uint32_t physical_address = GetPhysicalAddress(address);
+  for (auto invalidation_callback : memory_->physical_memory_invalidation_callbacks_) {
+    invalidation_callback->first(invalidation_callback->second, physical_address, size, true);
+  }
 }
 
 bool PhysicalHeap::Decommit(uint32_t address, uint32_t size) {

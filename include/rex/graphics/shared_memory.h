@@ -76,6 +76,10 @@ class SharedMemory {
   // was added, as invalidation of pages that are already invalid (and not
   // protected anymore) never happens.
   bool IsRangeValid(uint32_t start, uint32_t length) const;
+  // Host pointer to guest physical memory (as the CPU sees it, not the GPU copy).
+  const uint8_t* TranslateGuestPhysical(uint32_t address) const {
+    return memory().TranslatePhysical(address);
+  }
   // Unregisters previously registered watched memory range.
   void UnwatchMemoryRange(WatchHandle handle);
 

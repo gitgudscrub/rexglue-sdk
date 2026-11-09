@@ -238,6 +238,13 @@ class TextureCache {
 
     void LogAction(const char* action) const;
 
+    // texture_cache_verify (diagnostic): hash of the guest base level memory
+    // when it was last made up to date; checked while the texture is bound to
+    // find CPU writes the shared memory watch did not catch.
+    void VerifyUpToDate(const std::unique_lock<std::recursive_mutex>& global_lock);
+    uint64_t verify_base_hash_ = 0;
+    bool verify_base_hash_valid_ = false;
+
    protected:
     // If track_usage is false, the texture won't be added to the LRU list.
     explicit Texture(TextureCache& texture_cache, const TextureKey& key, bool track_usage = true);

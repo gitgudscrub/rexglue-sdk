@@ -614,6 +614,9 @@ class TextureCache {
   // so need to recheck if textures aren't outdated, disregarding whether fetch
   // constants have been changed.
   std::atomic<bool> texture_became_outdated_{false};
+  // Loads redone because the CPU wrote to the memory mid-load (see
+  // Texture::MakeUpToDateAndWatch). Changed with the global lock held.
+  uint64_t texture_load_rechecks_ = 0;
 
   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch

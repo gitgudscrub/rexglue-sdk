@@ -26,6 +26,13 @@
 #include <rex/logging.h>
 #include <rex/math.h>
 
+REXCVAR_DEFINE_BOOL(texture_cache_recheck_after_load, true, "GPU",
+                    "When a texture finishes loading, keep it outdated if the CPU wrote to "
+                    "its memory between the upload and the watch being added (otherwise the "
+                    "texture stays stale; seen with Bink videos)");
+REXCVAR_DEFINE_BOOL(texture_cache_verify, false, "GPU",
+                    "Diagnostic (slow): hash every bound texture's guest memory and log when "
+                    "it changed while the texture was considered up to date");
 REXCVAR_DEFINE_INT32(texture_cache_memory_limit_render_to_texture, 24, "GPU",
                      "Texture cache memory limit for render-to-texture (MB)")
     .range(1, 256)
@@ -591,6 +598,18 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
   if (bindings_changed) {
     UpdateTextureBindingsImpl(bindings_changed);
   }
+  if (REXCVAR_GET(texture_cache_verify)) {
+    auto global_lock = global_critical_region_.Acquire();
+    uint32_t verify_remaining = used_texture_mask;
+    uint32_t verify_index;
+    while (rex::bit_scan_forward(verify_remaining, &verify_index)) {
+      verify_remaining &= ~(UINT32_C(1) << verify_index);
+      const TextureBinding& binding = texture_bindings_[verify_index];
+      if (binding.texture) {
+        binding.texture->VerifyUpToDate(global_lock);
+      }
+    }
+  }
 }
 
 const char* TextureCache::TextureKey::GetLogDimensionName(xenos::DataDimension dimension) {
@@ -617,6 +636,31 @@ void TextureCache::TextureKey::LogAction(const char* action) const {
       GetDepthOrArraySize(), GetLogDimensionName(), FormatInfo::Get(format)->name,
       mip_max_level + 1, packed_mips ? "" : "un", mip_max_level != 0 ? "s" : "", base_page << 12,
       pitch << 5, mip_page << 12);
+}
+
+void TextureCache::Texture::VerifyUpToDate(
+    const std::unique_lock<std::recursive_mutex>& global_lock) {
+  if (base_outdated_ || !verify_base_hash_valid_ || key_.scaled_resolve) {
+    return;
+  }
+  SharedMemory& shared_memory = texture_cache_.shared_memory();
+  uint32_t start = key_.base_page << 12;
+  uint64_t hash = XXH3_64bits(shared_memory.memory().TranslatePhysical(start), GetGuestBaseSize());
+  if (hash == verify_base_hash_) {
+    return;
+  }
+  verify_base_hash_ = hash;
+  static uint32_t reports = 0;
+  if (++reports > 400) {
+    return;
+  }
+  REXGPU_WARN(
+      "texture_cache_verify: stale {}x{} {} {} texture at 0x{:08X} size 0x{:X}: memory changed "
+      "while up to date (pages valid: {}, watch: {})",
+      key_.GetWidth(), key_.GetHeight(), FormatInfo::Get(key_.format)->name,
+      key_.tiled ? "tiled" : "linear", start, GetGuestBaseSize(),
+      shared_memory.IsRangeValid(start, GetGuestBaseSize()) ? "yes" : "NO",
+      base_watch_handle_ ? "yes" : "NO");
 }
 
 void TextureCache::Texture::LogAction(const char* action) const {
@@ -689,19 +733,50 @@ TextureCache::Texture::~Texture() {
 void TextureCache::Texture::MakeUpToDateAndWatch(
     const std::unique_lock<std::recursive_mutex>& global_lock) {
   SharedMemory& shared_memory = texture_cache().shared_memory();
+  // The data was copied from shared memory after its pages were made valid,
+  // but the texture only starts watching them here. A CPU write in between
+  // invalidated (and unprotected) the pages without telling this texture, and
+  // later writes would not either, so the texture would stay stale. Leave such
+  // a level outdated so the next request loads it again (seen with Bink
+  // videos, whose decoder writes the frame textures on other threads).
+  // Scaled resolve textures are tracked through scaled resolve memory.
+  const bool recheck = REXCVAR_GET(texture_cache_recheck_after_load) && !key().scaled_resolve;
+  bool still_outdated = false;
   if (base_outdated_) {
     assert_not_zero(GetGuestBaseSize());
-    base_outdated_ = false;
-    base_watch_handle_ = shared_memory.WatchMemoryRange(
-        key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
-    outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+    if (recheck && !shared_memory.IsRangeValid(key().base_page << 12, GetGuestBaseSize())) {
+      still_outdated = true;
+    } else {
+      base_outdated_ = false;
+      base_watch_handle_ = shared_memory.WatchMemoryRange(
+          key().base_page << 12, GetGuestBaseSize(), TextureCache::WatchCallback, this, nullptr, 0);
+      outdated_mask_.fetch_and(~kOutdatedBitBase, std::memory_order_release);
+      if (REXCVAR_GET(texture_cache_verify)) {
+        verify_base_hash_ = XXH3_64bits(
+            shared_memory.memory().TranslatePhysical(key().base_page << 12), GetGuestBaseSize());
+        verify_base_hash_valid_ = true;
+      }
+    }
   }
-  if (mips_outdated_) {
+  if (mips_outdated_ && recheck &&
+      !shared_memory.IsRangeValid(key().mip_page << 12, GetGuestMipsSize())) {
+    still_outdated = true;
+  } else if (mips_outdated_) {
     assert_not_zero(GetGuestMipsSize());
     mips_outdated_ = false;
     mips_watch_handle_ = shared_memory.WatchMemoryRange(
         key().mip_page << 12, GetGuestMipsSize(), TextureCache::WatchCallback, this, nullptr, 1);
     outdated_mask_.fetch_and(~kOutdatedBitMips, std::memory_order_release);
+  }
+  if (still_outdated) {
+    // Make the next RequestTextures recheck its bindings (as a watch firing
+    // would), so the texture is loaded again.
+    texture_cache().texture_became_outdated_.store(true, std::memory_order_release);
+    uint64_t count = ++texture_cache().texture_load_rechecks_;
+    if ((count & (count - 1)) == 0) {
+      REXGPU_INFO("Texture cache: CPU wrote to a texture while it loaded, reloading ({} times)",
+                   count);
+    }
   }
 }
 

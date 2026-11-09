@@ -70,6 +70,12 @@ class SharedMemory {
   WatchHandle WatchMemoryRange(uint32_t start, uint32_t length, WatchCallback callback,
                                void* callback_context, void* callback_data,
                                uint64_t callback_argument);
+  // Whether every page of the range is still valid (uploaded and protected,
+  // so a CPU write to it would be caught). Call with the global critical
+  // region locked: a watch is only reliable if the pages were valid when it
+  // was added, as invalidation of pages that are already invalid (and not
+  // protected anymore) never happens.
+  bool IsRangeValid(uint32_t start, uint32_t length) const;
   // Unregisters previously registered watched memory range.
   void UnwatchMemoryRange(WatchHandle handle);
 

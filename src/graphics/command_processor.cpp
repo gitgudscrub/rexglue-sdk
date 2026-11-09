@@ -38,6 +38,12 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
+#if defined(_WIN32)
+// WakeByAddressAll (synchapi.h) without pulling <windows.h> into this file.
+extern "C" __declspec(dllimport) void __stdcall WakeByAddressAll(void* address);
+#pragma comment(lib, "Synchronization.lib")
+#endif
+
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
 REXCVAR_DEFINE_INT32(frame_limit, 0, "GPU",
@@ -1374,7 +1380,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   auto endianness = static_cast<xenos::Endian>(address & 0x3);
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
-  memory::store(memory_->TranslatePhysical(address), data_value);
+  void* host_address = memory_->TranslatePhysical(address);
+  memory::store(host_address, data_value);
+#if defined(_WIN32)
+  // Guest CPU threads that pace on this value (e.g. a frame limiter waiting
+  // for the GPU progress counter) can block in WaitOnAddress on it instead
+  // of spinning. Cheap when nobody waits: no system call.
+  WakeByAddressAll(host_address);
+#endif
   return true;
 }
 

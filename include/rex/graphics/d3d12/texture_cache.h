@@ -13,6 +13,7 @@
 
 #include <array>
 #include <deque>
+#include <unordered_set>
 #include <functional>
 #include <memory>
 #include <unordered_map>
@@ -293,9 +294,14 @@ class D3D12TextureCache final : public TextureCache {
       uint64_t last_check_time = 0;
       uint32_t quick_reloads = 0;
       bool skip = false;
+      // Waiting for the background load of the replacement for content_hash.
+      bool pending = false;
       Microsoft::WRL::ComPtr<ID3D12Resource> resource;
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
       uint32_t mip_count = 0;
+      // Video memory of the resource (not counted in the cache limits, so
+      // a big pack doesn't make the cache evict and reload in a loop).
+      uint64_t memory_usage = 0;
       // Descriptors of the replacement resource, by host swizzle.
       std::unordered_map<uint32_t, uint32_t> srv_descriptors;
     };
@@ -438,7 +444,11 @@ class D3D12TextureCache final : public TextureCache {
   // Texture packs: hashes a texture after its base level was loaded, dumps it
   // if enabled, and attaches or detaches its replacement.
   void UpdateTextureReplacement(D3D12Texture& texture);
-  bool LoadTextureReplacement(D3D12Texture& texture, const std::filesystem::path& path);
+  bool LoadTextureReplacement(D3D12Texture& texture, const texture_replacement::DdsImage& image,
+                              const std::filesystem::path& path);
+  // Uploads replacements the background loader finished, for textures still
+  // showing the content they were requested for.
+  void ApplyLoadedReplacements();
   // Releases the texture's replacement once the GPU is done with it.
   void DropTextureReplacement(D3D12Texture& texture);
   bool IsReplacementShown(const D3D12Texture& texture, xenos::DataDimension dimension,
@@ -527,6 +537,11 @@ class D3D12TextureCache final : public TextureCache {
 
   texture_replacement::TextureReplacer texture_replacer_;
   bool texture_replacer_initialized_ = false;
+  // Textures waiting for a background replacement load.
+  std::unordered_set<D3D12Texture*> replacement_pending_;
+  // Video memory of all attached replacements.
+  uint64_t replacement_memory_total_ = 0;
+  std::vector<texture_replacement::TextureReplacer::LoadedImage> replacement_loaded_;
   // Last seen value of the texture_replacement cvar.
   bool replacement_shown_ = true;
   // Replacement resources, upload buffers and descriptors waiting for the GPU

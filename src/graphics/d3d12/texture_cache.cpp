@@ -741,6 +741,7 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
     ResetTextureBindings();
     REXGPU_INFO("Texture pack: {}", replacement_shown ? "replacements shown" : "originals shown");
   }
+  ApplyLoadedReplacements();
 
   TextureCache::RequestTextures(used_texture_mask);
 
@@ -1480,6 +1481,10 @@ D3D12TextureCache::D3D12Texture::~D3D12Texture() {
   for (const auto& descriptor_pair : replacement_.srv_descriptors) {
     d3d12_texture_cache.ReleaseTextureDescriptor(descriptor_pair.second);
   }
+  if (replacement_.pending) {
+    d3d12_texture_cache.replacement_pending_.erase(this);
+  }
+  d3d12_texture_cache.replacement_memory_total_ -= replacement_.memory_usage;
 }
 
 bool D3D12TextureCache::IsDecompressionNeeded(xenos::TextureFormat format, uint32_t width,
@@ -2400,23 +2405,52 @@ void D3D12TextureCache::UpdateTextureReplacement(D3D12Texture& texture) {
   }
 
   DropTextureReplacement(texture);
-  std::filesystem::path path = texture_replacer_.FindReplacement(hash);
-  if (!path.empty()) {
-    LoadTextureReplacement(texture, path);
+  if (texture_replacer_.RequestLoad(hash)) {
+    replacement.pending = true;
+    replacement_pending_.insert(&texture);
+  }
+}
+
+void D3D12TextureCache::ApplyLoadedReplacements() {
+  if (replacement_pending_.empty()) {
+    return;
+  }
+  replacement_loaded_.clear();
+  texture_replacer_.CollectLoaded(replacement_loaded_);
+  if (replacement_loaded_.empty()) {
+    return;
+  }
+  static uint32_t warnings = 0;
+  bool any_attached = false;
+  for (const auto& loaded : replacement_loaded_) {
+    if (!loaded.image && ++warnings <= 64) {
+      REXGPU_WARN("Texture pack: can't read {} (unsupported or broken DDS)",
+                  rex::path_to_utf8(loaded.path));
+    }
+    for (auto it = replacement_pending_.begin(); it != replacement_pending_.end();) {
+      D3D12Texture& texture = **it;
+      if (texture.replacement_.content_hash != loaded.hash) {
+        ++it;
+        continue;
+      }
+      texture.replacement_.pending = false;
+      it = replacement_pending_.erase(it);
+      if (loaded.image && LoadTextureReplacement(texture, *loaded.image, loaded.path)) {
+        any_attached = true;
+      }
+    }
+  }
+  replacement_loaded_.clear();
+  if (any_attached) {
+    // Bindings of these textures still point at the original descriptors.
+    ResetTextureBindings();
   }
 }
 
 bool D3D12TextureCache::LoadTextureReplacement(D3D12Texture& texture,
+                                               const texture_replacement::DdsImage& image,
                                                const std::filesystem::path& path) {
   static uint32_t warnings = 0;
-  texture_replacement::DdsImage image;
-  if (!texture_replacement::LoadDds(path, image)) {
-    if (++warnings <= 64) {
-      REXGPU_WARN("Texture pack: can't read {} (unsupported or broken DDS)",
-                  rex::path_to_utf8(path));
-    }
-    return false;
-  }
   const TextureKey key = texture.key();
   if (uint64_t(image.width) * key.GetHeight() != uint64_t(image.height) * key.GetWidth()) {
     if (++warnings <= 64) {
@@ -2513,19 +2547,26 @@ bool D3D12TextureCache::LoadTextureReplacement(D3D12Texture& texture,
   replacement.resource = std::move(resource);
   replacement.format = desc.Format;
   replacement.mip_count = image.mip_count;
+  replacement.memory_usage = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
+  replacement_memory_total_ += replacement.memory_usage;
 
   static uint32_t loads = 0;
   ++loads;
   if (loads <= 32 || (loads & (loads - 1)) == 0) {
-    REXGPU_INFO("Texture pack: {}x{} {} replaced by {}x{} {} ({} loaded so far)", key.GetWidth(),
-                key.GetHeight(), FormatInfo::Get(key.format)->name, image.width, image.height,
-                rex::path_to_utf8(path.filename()), loads);
+    REXGPU_INFO("Texture pack: {}x{} {} replaced by {}x{} {} ({} loaded so far, {} MB in use)",
+                key.GetWidth(), key.GetHeight(), FormatInfo::Get(key.format)->name, image.width,
+                image.height, rex::path_to_utf8(path.filename()), loads,
+                replacement_memory_total_ >> 20);
   }
   return true;
 }
 
 void D3D12TextureCache::DropTextureReplacement(D3D12Texture& texture) {
   D3D12Texture::Replacement& replacement = texture.replacement_;
+  if (replacement.pending) {
+    replacement.pending = false;
+    replacement_pending_.erase(&texture);
+  }
   if (!replacement.resource) {
     return;
   }
@@ -2536,6 +2577,8 @@ void D3D12TextureCache::DropTextureReplacement(D3D12Texture& texture) {
     garbage.descriptors.push_back(descriptor_pair.second);
   }
   replacement.srv_descriptors.clear();
+  replacement_memory_total_ -= replacement.memory_usage;
+  replacement.memory_usage = 0;
   replacement.format = DXGI_FORMAT_UNKNOWN;
   replacement.mip_count = 0;
   replacement_garbage_.push_back(std::move(garbage));

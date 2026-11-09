@@ -105,9 +105,22 @@ class TextureReplacer {
   // Replacement file for a hash, or an empty path.
   std::filesystem::path FindReplacement(uint64_t hash) const;
 
+  // Starts reading the replacement for a hash on a background thread.
+  // Returns false if the pack has no replacement for it.
+  bool RequestLoad(uint64_t hash);
+  struct LoadedImage {
+    uint64_t hash;
+    std::filesystem::path path;
+    // Null if the file couldn't be read.
+    std::unique_ptr<DdsImage> image;
+  };
+  // Moves out the loads finished since the last call.
+  void CollectLoaded(std::vector<LoadedImage>& out);
+
  private:
   struct DumpJob;
   class DumpWorker;
+  class LoadWorker;
 
   bool dump_enabled_ = false;
   std::filesystem::path dump_dir_;
@@ -119,6 +132,7 @@ class TextureReplacer {
   std::vector<uint8_t> last_untiled_;
 
   std::unique_ptr<DumpWorker> dump_worker_;
+  std::unique_ptr<LoadWorker> load_worker_;
 };
 
 }  // namespace rex::graphics::texture_replacement

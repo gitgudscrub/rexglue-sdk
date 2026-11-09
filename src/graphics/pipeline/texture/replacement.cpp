@@ -505,6 +505,72 @@ class TextureReplacer::DumpWorker {
   std::thread thread_;
 };
 
+class TextureReplacer::LoadWorker {
+ public:
+  LoadWorker() : thread_([this] { Run(); }) {}
+  ~LoadWorker() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_one();
+    thread_.join();
+  }
+
+  void Request(uint64_t hash, const std::filesystem::path& path) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (!in_flight_.insert(hash).second) {
+        return;  // Already queued or being read.
+      }
+      queue_.emplace_back(hash, path);
+    }
+    cv_.notify_one();
+  }
+
+  void Collect(std::vector<LoadedImage>& out) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (LoadedImage& loaded : done_) {
+      in_flight_.erase(loaded.hash);
+      out.push_back(std::move(loaded));
+    }
+    done_.clear();
+  }
+
+ private:
+  void Run() {
+    while (true) {
+      std::pair<uint64_t, std::filesystem::path> job;
+      {
+        std::unique_lock<std::mutex> lock(mutex_);
+        cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
+        if (stop_) {
+          return;
+        }
+        job = std::move(queue_.front());
+        queue_.pop_front();
+      }
+      LoadedImage loaded;
+      loaded.hash = job.first;
+      loaded.path = job.second;
+      auto image = std::make_unique<DdsImage>();
+      if (LoadDds(job.second, *image)) {
+        loaded.image = std::move(image);
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      done_.push_back(std::move(loaded));
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<std::pair<uint64_t, std::filesystem::path>> queue_;
+  std::vector<LoadedImage> done_;
+  std::unordered_set<uint64_t> in_flight_;
+  bool stop_ = false;
+  std::thread thread_;
+};
+
 TextureReplacer::TextureReplacer() = default;
 TextureReplacer::~TextureReplacer() { Shutdown(); }
 
@@ -565,6 +631,7 @@ void TextureReplacer::Initialize() {
 }
 
 void TextureReplacer::Shutdown() {
+  load_worker_.reset();
   dump_worker_.reset();
   dump_enabled_ = false;
   replacements_.clear();
@@ -643,6 +710,24 @@ void TextureReplacer::DumpLastHashed(uint64_t hash) {
 std::filesystem::path TextureReplacer::FindReplacement(uint64_t hash) const {
   auto it = replacements_.find(hash);
   return it != replacements_.end() ? it->second : std::filesystem::path();
+}
+
+bool TextureReplacer::RequestLoad(uint64_t hash) {
+  auto it = replacements_.find(hash);
+  if (it == replacements_.end()) {
+    return false;
+  }
+  if (!load_worker_) {
+    load_worker_ = std::make_unique<LoadWorker>();
+  }
+  load_worker_->Request(hash, it->second);
+  return true;
+}
+
+void TextureReplacer::CollectLoaded(std::vector<LoadedImage>& out) {
+  if (load_worker_) {
+    load_worker_->Collect(out);
+  }
 }
 
 }  // namespace rex::graphics::texture_replacement

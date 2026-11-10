@@ -103,6 +103,9 @@ class D3D12TextureCache final : public TextureCache {
   // (notifying the command processor about that), so this must be called before
   // binding the actual drawing pipeline.
   void RequestTextures(uint32_t used_texture_mask) override;
+  // Texture pack content hash (as in the dump file names) of the texture
+  // bound at a fetch constant, or 0 if none / not hashed. For diagnostics.
+  uint64_t GetBoundTextureContentHash(uint32_t fetch_constant_index) const;
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and

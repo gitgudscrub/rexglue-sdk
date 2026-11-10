@@ -14,6 +14,7 @@
 #include <cstring>
 #include <sstream>
 #include <map>
+#include <tuple>
 #include <utility>
 
 #include <rex/assert.h>
@@ -62,6 +63,11 @@ REXCVAR_DEFINE_INT32(log_frame_shaders, 0, "GPU/D3D12",
                      "Diagnostic: log every vertex/pixel shader pair drawn in the next N frames, "
                      "with draw counts, in first-drawn order")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(log_frame_textures, 0, "GPU/D3D12",
+                     "Diagnostic: log every (pixel shader, fetch constant, texture hash) used in "
+                     "the next N frames, with draw counts; texture hashes are the texture pack's "
+                     "dump names")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace {
 // log_frame_shaders: (vertex hash, pixel hash) -> (first draw index, draws).
 struct FrameShaderLog {
@@ -69,6 +75,12 @@ struct FrameShaderLog {
   uint32_t draws = 0;
 };
 FrameShaderLog frame_shader_log;
+// log_frame_textures: (pixel hash, fetch constant, texture hash) -> (first draw, draws).
+struct FrameTextureLog {
+  std::map<std::tuple<uint64_t, uint32_t, uint64_t>, std::pair<uint32_t, uint32_t>> uses;
+  uint32_t draws = 0;
+};
+FrameTextureLog frame_texture_log;
 
 }  // namespace
 
@@ -2073,6 +2085,22 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     frame_shader_log = {};
     REXCVAR_SET(log_frame_shaders, REXCVAR_GET(log_frame_shaders) - 1);
   }
+  if (REXCVAR_GET(log_frame_textures) > 0) {
+    std::vector<std::pair<uint32_t, std::tuple<uint64_t, uint32_t, uint64_t>>> order;
+    for (const auto& [key, value] : frame_texture_log.uses) {
+      order.emplace_back(value.first, key);
+    }
+    std::sort(order.begin(), order.end());
+    REXGPU_INFO("[frame-textures] frame {}: {} draws, {} shader/texture uses", frame_current_,
+                frame_texture_log.draws, order.size());
+    for (const auto& [first, key] : order) {
+      REXGPU_INFO("[frame-textures]   first {:5} draws {:4} ps {:016X} tf{:<2} tex {:016X}", first,
+                  frame_texture_log.uses[key].second, std::get<0>(key), std::get<1>(key),
+                  std::get<2>(key));
+    }
+    frame_texture_log = {};
+    REXCVAR_SET(log_frame_textures, REXCVAR_GET(log_frame_textures) - 1);
+  }
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3197,6 +3225,19 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  if (REXCVAR_GET(log_frame_textures) > 0) {
+    uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0);
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t fetch_index;
+    while (rex::bit_scan_forward(textures_remaining, &fetch_index)) {
+      textures_remaining &= ~(uint32_t(1) << fetch_index);
+      uint64_t tex_hash = texture_cache_->GetBoundTextureContentHash(fetch_index);
+      auto key = std::make_tuple(ps_hash, fetch_index, tex_hash);
+      auto it = frame_texture_log.uses.try_emplace(key, frame_texture_log.draws, 0).first;
+      ++it->second.second;
+    }
+    ++frame_texture_log.draws;
+  }
 
   // Bind the pipeline after configuring it and doing everything that may bind
   // other pipelines.

@@ -2317,6 +2317,15 @@ bool D3D12TextureCache::IsReplacementShown(const D3D12Texture& texture,
          texture.key().dimension == xenos::DataDimension::k2DOrStacked;
 }
 
+uint64_t D3D12TextureCache::GetBoundTextureContentHash(uint32_t fetch_constant_index) const {
+  const TextureBinding* binding = GetValidTextureBinding(fetch_constant_index);
+  if (!binding || !binding->texture) {
+    return 0;
+  }
+  const D3D12Texture& texture = *static_cast<const D3D12Texture*>(binding->texture);
+  return texture.replacement_.content_hash_valid ? texture.replacement_.content_hash : 0;
+}
+
 void D3D12TextureCache::UpdateTextureReplacement(D3D12Texture& texture) {
   if (!texture_replacer_.IsActive()) {
     return;

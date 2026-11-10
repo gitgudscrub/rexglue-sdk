@@ -92,7 +92,9 @@ class TextureReplacer {
 
   // Whether hashing loaded textures is useful at all (dumping on, or a pack
   // with at least one replacement).
-  bool IsActive() const { return dump_enabled_ || !replacements_.empty(); }
+  bool IsActive() const {
+    return dump_enabled_ || !replacements_.empty() || !highlights_.empty();
+  }
   bool dump_enabled() const { return dump_enabled_; }
 
   // Untiles the base level into an internal buffer and returns its hash.
@@ -116,6 +118,8 @@ class TextureReplacer {
   };
   // Moves out the loads finished since the last call.
   void CollectLoaded(std::vector<LoadedImage>& out);
+  // Whether the hash is in the texture_highlight list (see the cvar).
+  bool IsHighlighted(uint64_t hash) const;
 
  private:
   struct DumpJob;
@@ -126,6 +130,8 @@ class TextureReplacer {
   std::filesystem::path dump_dir_;
   std::unordered_map<uint64_t, std::filesystem::path> replacements_;
   std::unordered_set<uint64_t> dumped_;
+  // texture_highlight: upper-case hex hash prefixes.
+  std::vector<std::string> highlights_;
 
   // Last Hash() input, untiled.
   GuestTexture last_texture_{};

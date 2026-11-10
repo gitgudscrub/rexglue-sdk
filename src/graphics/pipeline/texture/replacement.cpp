@@ -5,6 +5,7 @@
 #include <rex/graphics/pipeline/texture/replacement.h>
 
 #include <algorithm>
+#include <cctype>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +30,11 @@ REXCVAR_DEFINE_BOOL(texture_dump, false, "GPU",
 REXCVAR_DEFINE_BOOL(texture_replacement, true, "GPU",
                     "Show replacement textures from <texture_pack_root>/replace (false = the "
                     "original textures). Can be changed while running.");
+REXCVAR_DEFINE_STRING(texture_highlight, "", "GPU",
+                      "Diagnostic: comma-separated texture hashes (or prefixes of at least 6 hex "
+                      "digits, as in the dump file names) to show as solid colours (magenta, red, "
+                      "green, blue, yellow, cyan, white, orange in list order) so the surfaces "
+                      "using them can be found");
 
 namespace rex::graphics::texture_replacement {
 
@@ -530,6 +536,13 @@ class TextureReplacer::LoadWorker {
     cv_.notify_one();
   }
 
+  // Hands over an image made in memory (texture_highlight) as if it had been
+  // read from a file.
+  void PushReady(LoadedImage&& loaded) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    done_.push_back(std::move(loaded));
+  }
+
   void Collect(std::vector<LoadedImage>& out) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (LoadedImage& loaded : done_) {
@@ -607,6 +620,32 @@ void TextureReplacer::Initialize() {
   REXGPU_INFO("Texture pack: {} replacement textures in {}", replacements_.size(),
               rex::path_to_utf8(replace_dir));
 
+  highlights_.clear();
+  {
+    const std::string& list = REXCVAR_GET(texture_highlight);
+    size_t start = 0;
+    while (start <= list.size()) {
+      size_t end = list.find(',', start);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      std::string entry = list.substr(start, end - start);
+      start = end + 1;
+      std::string prefix;
+      for (char c : entry) {
+        if (std::isxdigit(static_cast<unsigned char>(c))) {
+          prefix.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        }
+      }
+      if (prefix.size() >= 6 && prefix.size() <= 16) {
+        highlights_.push_back(prefix);
+      }
+    }
+    if (!highlights_.empty()) {
+      REXGPU_INFO("Texture highlight: {} textures", highlights_.size());
+    }
+  }
+
   dump_enabled_ = REXCVAR_GET(texture_dump);
   if (dump_enabled_) {
     dump_dir_ = root / "dump";
@@ -638,6 +677,7 @@ void TextureReplacer::Shutdown() {
   dump_enabled_ = false;
   replacements_.clear();
   dumped_.clear();
+  highlights_.clear();
   last_untiled_.clear();
   last_untiled_.shrink_to_fit();
 }
@@ -714,7 +754,55 @@ std::filesystem::path TextureReplacer::FindReplacement(uint64_t hash) const {
   return it != replacements_.end() ? it->second : std::filesystem::path();
 }
 
+bool TextureReplacer::IsHighlighted(uint64_t hash) const {
+  if (highlights_.empty()) {
+    return false;
+  }
+  std::string text = HashPrefix(hash);
+  for (const std::string& prefix : highlights_) {
+    if (text.compare(0, prefix.size(), prefix) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
 bool TextureReplacer::RequestLoad(uint64_t hash) {
+  if (!highlights_.empty()) {
+    // A solid-colour stand-in, the size of the texture last hashed (this is
+    // called right after Hash for it), in the list's colour.
+    std::string text = HashPrefix(hash);
+    for (size_t i = 0; i < highlights_.size(); ++i) {
+      if (text.compare(0, highlights_[i].size(), highlights_[i]) != 0) {
+        continue;
+      }
+      static const uint8_t kColours[8][4] = {
+          {255, 0, 255, 255}, {255, 0, 0, 255},     {0, 255, 0, 255},     {0, 0, 255, 255},
+          {255, 255, 0, 255}, {0, 255, 255, 255},   {255, 255, 255, 255}, {255, 128, 0, 255}};
+      const uint8_t* colour = kColours[i & 7];
+      LoadedImage loaded;
+      loaded.hash = hash;
+      loaded.path = std::filesystem::u8path("texture_highlight");
+      auto image = std::make_unique<DdsImage>();
+      image->dxgi_format = 28;  // R8G8B8A8_UNORM
+      image->width = std::max(last_texture_.width, uint32_t(1));
+      image->height = std::max(last_texture_.height, uint32_t(1));
+      image->mip_count = 1;
+      image->bytes_per_block = 4;
+      image->block_compressed = false;
+      image->mip_offsets = {0};
+      image->data.resize(size_t(image->width) * image->height * 4);
+      for (size_t p = 0; p < image->data.size(); p += 4) {
+        std::memcpy(&image->data[p], colour, 4);
+      }
+      loaded.image = std::move(image);
+      if (!load_worker_) {
+        load_worker_ = std::make_unique<LoadWorker>();
+      }
+      load_worker_->PushReady(std::move(loaded));
+      return true;
+    }
+  }
   auto it = replacements_.find(hash);
   if (it == replacements_.end()) {
     return false;

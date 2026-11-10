@@ -78,6 +78,14 @@ class D3D12CommandProcessor : public CommandProcessor {
   }
 
   uint64_t GetCurrentFrame() const { return frame_current_; }
+
+  // Ambient occlusion (post_ao): the render target cache reports the scene
+  // depth resolve here with the host depth render target (in
+  // NON_PIXEL_SHADER_RESOURCE) and the size of the resolved region in host
+  // pixels. Returns quickly when AO is off or the region doesn't look like a
+  // full-screen scene depth.
+  void CaptureSceneDepth(ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
+                         uint32_t width, uint32_t height, bool multisampled);
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
   // Returns true if the barrier has been inserted (the new state is different).
@@ -616,7 +624,24 @@ class D3D12CommandProcessor : public CommandProcessor {
     float keep_exposure;
     float mean_blend;
     uint32_t pass_param;
+    float ao_strength;
+    uint32_t ao_mode;
+    uint32_t pad[2];
   };
+  // post_ao.cs.hlsl, same root signature (16 root constants).
+  struct PostAoConstants {
+    uint32_t depth_size[2];
+    uint32_t ao_size[2];
+    float radius;
+    float bias;
+    float intensity;
+    float tan_half_fov;
+    uint32_t reversed_z;
+    float max_radius_px;
+    float fade_distance;
+    uint32_t pad[5];
+  };
+  static_assert(sizeof(PostAoConstants) == sizeof(PostGradeConstants));
   enum class PostGradeRootParameter : UINT {
     kConstants,
     kSource,
@@ -624,6 +649,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     kMean,
     kDestination,
     kMeanOut,
+    kAo,
 
     kCount,
   };
@@ -642,6 +668,15 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_mean_texture_;
   uint64_t post_grade_submission_ = 0;
   bool post_grade_mean_valid_ = false;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_ao_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_ao_ms_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_ao_blur_h_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_ao_blur_v_pipeline_;
+  // Half-res R16G16_FLOAT (occlusion, view depth), ping-pong; result in [0].
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_ao_textures_[2];
+  // Frame in which post_ao_textures_[0] was last filled (0 = never).
+  uint64_t post_ao_frame_ = 0;
+  bool post_ao_logged_ = false;
   bool InitializePostGrade();
   bool EnsurePostGradeTextures(uint32_t width, uint32_t height);
   void ReleasePostGradeTextures();

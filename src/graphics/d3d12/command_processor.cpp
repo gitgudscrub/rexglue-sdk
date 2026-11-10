@@ -57,6 +57,39 @@ REXCVAR_DEFINE_DOUBLE(post_grade_keep_exposure, 1.0, "GPU/D3D12",
                       "Grade: how much of the original average brightness is kept (0..1)")
     .range(0.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_ao, false, "GPU/D3D12",
+                    "Modern-graphics ambient occlusion from the game's scene depth, applied "
+                    "by the colour grade (needs post_grade)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_strength, 0.6, "GPU/D3D12", "AO: how much is applied (0..1)")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_radius, 400.0, "GPU/D3D12",
+                      "AO: sampling radius in near-plane units")
+    .range(0.1, 10000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_intensity, 1.0, "GPU/D3D12", "AO: occlusion gain")
+    .range(0.0, 10.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_bias, 0.01, "GPU/D3D12",
+                      "AO: self-occlusion bias as a fraction of view depth")
+    .range(0.0, 0.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_max_radius, 0.02, "GPU/D3D12",
+                      "AO: largest screen radius as a fraction of the screen height")
+    .range(0.0, 0.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_fade_distance, 20000.0, "GPU/D3D12",
+                      "AO: view depth where occlusion has faded out, near-plane units")
+    .range(1.0, 1e9)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_ao_reversed_z, true, "GPU/D3D12",
+                    "AO: scene depth 0 is far (true for Fable II)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(post_ao_debug, 0, "GPU/D3D12",
+                     "AO: 1 shows the occlusion, 2 shows depth bands (checks alignment)")
+    .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -122,6 +155,10 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/post_grade_down_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_grade_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_mean_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_ao_ao_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_ao_ao_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_ao_blur_h_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_ao_blur_v_cs.h"
 }  // namespace shaders
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
@@ -1766,6 +1803,12 @@ void D3D12CommandProcessor::ShutdownContext() {
   post_grade_blur_h_pipeline_.Reset();
   post_grade_down_pipeline_.Reset();
   post_grade_root_signature_.Reset();
+  post_ao_textures_[0].Reset();
+  post_ao_textures_[1].Reset();
+  post_ao_pipeline_.Reset();
+  post_ao_ms_pipeline_.Reset();
+  post_ao_blur_h_pipeline_.Reset();
+  post_ao_blur_v_pipeline_.Reset();
 
   fxaa_extreme_pipeline_.Reset();
   fxaa_pipeline_.Reset();
@@ -2335,8 +2378,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           // t0 source, t1 luma, t2 mean, u0 destination, u1 mean out, per pass:
           // down (t0 u0), blur_h (t1 u0), blur_v (t1 u0), mean (t1 u1),
           // grade (t0 t1 t2 u0).
-          ui::d3d12::util::DescriptorCpuGpuHandlePair d[12];
-          if (!RequestOneUseSingleViewDescriptors(12, d)) {
+          ui::d3d12::util::DescriptorCpuGpuHandlePair d[13];
+          if (!RequestOneUseSingleViewDescriptors(13, d)) {
             // Show the ungraded frame.
             PushTransitionBarrier(apply_gamma_dest, apply_gamma_dest_initial_state,
                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2380,6 +2423,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             srv(mean_texture, DXGI_FORMAT_R32_FLOAT, d[10].first);
             uav(guest_output_resource, ui::d3d12::D3D12Presenter::kGuestOutputFormat,
                 d[11].first);
+            // AO only if it was computed for this frame (no scene depth in
+            // menus and loading screens).
+            bool use_ao = REXCVAR_GET(post_ao) && post_ao_textures_[0] &&
+                          post_ao_frame_ == frame_current_;
+            if (use_ao) {
+              srv(post_ao_textures_[0].Get(), DXGI_FORMAT_R16G16_FLOAT, d[12].first);
+            } else {
+              D3D12_SHADER_RESOURCE_VIEW_DESC null_desc = {};
+              null_desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+              null_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+              null_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+              null_desc.Texture2D.MipLevels = 1;
+              device->CreateShaderResourceView(nullptr, &null_desc, d[12].first);
+            }
 
             PostGradeConstants constants = {};
             constants.size[0] = guest_output_width;
@@ -2395,6 +2452,8 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             constants.mean_blend = 0.05f;
             constants.pass_param = post_grade_mean_valid_ ? 0 : 1;
             post_grade_mean_valid_ = true;
+            constants.ao_strength = float(REXCVAR_GET(post_ao_strength));
+            constants.ao_mode = use_ao ? 1 + uint32_t(REXCVAR_GET(post_ao_debug)) : 0;
 
             deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());
             deferred_command_list_.D3DSetComputeRoot32BitConstants(
@@ -2436,6 +2495,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             table(PostGradeRootParameter::kLuma, d[9]);
             table(PostGradeRootParameter::kMean, d[10]);
             table(PostGradeRootParameter::kDestination, d[11]);
+            table(PostGradeRootParameter::kAo, d[12]);
             pass(post_grade_grade_pipeline_.Get(), guest_output_resource,
                  ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
                  (guest_output_width + 15) / 16, (guest_output_height + 7) / 8);
@@ -2470,7 +2530,7 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   parameters[0].Constants.RegisterSpace = 0;
   parameters[0].Constants.Num32BitValues = sizeof(PostGradeConstants) / sizeof(uint32_t);
   parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
-  // kSource t0, kLuma t1, kMean t2, kDestination u0, kMeanOut u1.
+  // kSource t0, kLuma t1, kMean t2, kDestination u0, kMeanOut u1, kAo t3.
   const struct {
     D3D12_DESCRIPTOR_RANGE_TYPE type;
     UINT reg;
@@ -2478,7 +2538,8 @@ bool D3D12CommandProcessor::InitializePostGrade() {
                 {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1},
                 {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2},
                 {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0},
-                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1}};
+                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3}};
   for (UINT i = 1; i < UINT(PostGradeRootParameter::kCount); ++i) {
     D3D12_DESCRIPTOR_RANGE& range = ranges[i];
     range.RangeType = tables[i - 1].type;
@@ -2521,6 +2582,10 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   REX_POST_GRADE_PIPELINE(post_grade_blur_v_pipeline_, post_grade_blur_v_cs)
   REX_POST_GRADE_PIPELINE(post_grade_mean_pipeline_, post_grade_mean_cs)
   REX_POST_GRADE_PIPELINE(post_grade_grade_pipeline_, post_grade_grade_cs)
+  REX_POST_GRADE_PIPELINE(post_ao_pipeline_, post_ao_ao_cs)
+  REX_POST_GRADE_PIPELINE(post_ao_ms_pipeline_, post_ao_ao_ms_cs)
+  REX_POST_GRADE_PIPELINE(post_ao_blur_h_pipeline_, post_ao_blur_h_cs)
+  REX_POST_GRADE_PIPELINE(post_ao_blur_v_pipeline_, post_ao_blur_v_cs)
 #undef REX_POST_GRADE_PIPELINE
   return true;
 }
@@ -2578,6 +2643,128 @@ bool D3D12CommandProcessor::EnsurePostGradeTextures(uint32_t width, uint32_t hei
   }
   post_grade_mean_valid_ = false;
   return true;
+}
+
+void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
+                                              D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
+                                              uint32_t width, uint32_t height,
+                                              bool multisampled) {
+  if (!REXCVAR_GET(post_ao) || !REXCVAR_GET(post_grade) || !post_ao_pipeline_ || !depth ||
+      width < 64 || height < 64) {
+    return;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  uint32_t ao_width = (width + 1) / 2, ao_height = (height + 1) / 2;
+  if (post_ao_textures_[0]) {
+    D3D12_RESOURCE_DESC existing = post_ao_textures_[0]->GetDesc();
+    if (existing.Width != ao_width || existing.Height != ao_height) {
+      for (auto& texture : post_ao_textures_) {
+        texture->AddRef();
+        resources_for_deletion_.emplace_back(submission_current_, texture.Get());
+        texture.Reset();
+      }
+    }
+  }
+  if (!post_ao_textures_[0]) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = ao_width;
+    desc.Height = ao_height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    desc.SampleDesc.Count = 1;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    for (auto& texture : post_ao_textures_) {
+      if (FAILED(device->CreateCommittedResource(
+              &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(),
+              &desc, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr,
+              IID_PPV_ARGS(&texture)))) {
+        REXGPU_ERROR("Failed to create the ambient occlusion textures");
+        post_ao_textures_[0].Reset();
+        post_ao_textures_[1].Reset();
+        return;
+      }
+    }
+  }
+  if (!post_ao_logged_) {
+    post_ao_logged_ = true;
+    REXGPU_INFO("Ambient occlusion: scene depth {}x{}{}, occlusion {}x{}", width, height,
+                multisampled ? " (MSAA)" : "", ao_width, ao_height);
+  }
+
+  // d0 depth SRV, d1 ao0 UAV, d2 ao0 SRV, d3 ao1 UAV, d4 ao1 SRV, d5 ao0 UAV.
+  ui::d3d12::util::DescriptorCpuGpuHandlePair d[6];
+  if (!RequestOneUseSingleViewDescriptors(6, d)) {
+    return;
+  }
+  device->CopyDescriptorsSimple(1, d[0].first, depth_srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  ID3D12Resource* ao0 = post_ao_textures_[0].Get();
+  ID3D12Resource* ao1 = post_ao_textures_[1].Get();
+  auto srv = [&](ID3D12Resource* r, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    desc.Texture2D.MipLevels = 1;
+    device->CreateShaderResourceView(r, &desc, h);
+  };
+  auto uav = [&](ID3D12Resource* r, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+    D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+    desc.Format = DXGI_FORMAT_R16G16_FLOAT;
+    desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(r, nullptr, &desc, h);
+  };
+  uav(ao0, d[1].first);
+  srv(ao0, d[2].first);
+  uav(ao1, d[3].first);
+  srv(ao1, d[4].first);
+  uav(ao0, d[5].first);
+
+  PostAoConstants constants = {};
+  constants.depth_size[0] = width;
+  constants.depth_size[1] = height;
+  constants.ao_size[0] = ao_width;
+  constants.ao_size[1] = ao_height;
+  constants.radius = float(REXCVAR_GET(post_ao_radius));
+  constants.bias = float(REXCVAR_GET(post_ao_bias));
+  constants.intensity = float(REXCVAR_GET(post_ao_intensity));
+  constants.tan_half_fov = 0.7f;
+  constants.reversed_z = REXCVAR_GET(post_ao_reversed_z) ? 1 : 0;
+  constants.max_radius_px = float(REXCVAR_GET(post_ao_max_radius)) * float(height);
+  constants.fade_distance = float(REXCVAR_GET(post_ao_fade_distance));
+
+  deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(
+      UINT(PostGradeRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t), &constants,
+      0);
+  auto table = [&](PostGradeRootParameter p,
+                   const ui::d3d12::util::DescriptorCpuGpuHandlePair& h) {
+    deferred_command_list_.D3DSetComputeRootDescriptorTable(UINT(p), h.second);
+  };
+  const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  const D3D12_RESOURCE_STATES kWrite = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+  uint32_t groups_x = (ao_width + 7) / 8, groups_y = (ao_height + 7) / 8;
+  auto pass = [&](ID3D12PipelineState* pipeline, ID3D12Resource* written) {
+    PushTransitionBarrier(written, kRead, kWrite);
+    SetExternalPipeline(pipeline);
+    SubmitBarriers();
+    deferred_command_list_.D3DDispatch(groups_x, groups_y, 1);
+    PushTransitionBarrier(written, kWrite, kRead);
+  };
+  // The root signature is shared with the grade: post_ao.cs.hlsl reads the
+  // depth from t0 (kSource) and the occlusion from t1 (kLuma).
+  table(PostGradeRootParameter::kSource, d[0]);
+  table(PostGradeRootParameter::kDestination, d[1]);
+  pass(multisampled ? post_ao_ms_pipeline_.Get() : post_ao_pipeline_.Get(), ao0);
+  table(PostGradeRootParameter::kLuma, d[2]);
+  table(PostGradeRootParameter::kDestination, d[3]);
+  pass(post_ao_blur_h_pipeline_.Get(), ao1);
+  table(PostGradeRootParameter::kLuma, d[4]);
+  table(PostGradeRootParameter::kDestination, d[5]);
+  pass(post_ao_blur_v_pipeline_.Get(), ao0);
+  post_ao_frame_ = frame_current_;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {

@@ -38,6 +38,9 @@
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_INT32(log_resolves, 0, "GPU/D3D12",
+                     "Diagnostic: log the next N EDRAM resolves (colour/depth, size, destination)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(native_stencil_value_output_d3d12_intel, false, "GPU/D3D12",
                     "Native stencil value output for Intel D3D12");
 
@@ -1184,6 +1187,21 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
     return true;
   }
 
+  // Diagnostic: log the next N resolves (cvar log_resolves, set from the
+  // console), to find which ones carry the scene colour and depth.
+  if (REXCVAR_GET(log_resolves) > 0) {
+    REXCVAR_SET(log_resolves, REXCVAR_GET(log_resolves) - 1);
+    REXGPU_INFO(
+        "[resolve] {} {}x{} src_base {} dest 0x{:08X} len {} fmt {} clear {}",
+        resolve_info.IsCopyingDepth() ? "depth" : "color",
+        uint32_t(resolve_info.coordinate_info.width_div_8) * 8, resolve_info.height_div_8 * 8,
+        resolve_info.IsCopyingDepth() ? resolve_info.depth_original_base
+                                      : resolve_info.color_original_base,
+        resolve_info.copy_dest_base, resolve_info.copy_dest_extent_length,
+        uint32_t(resolve_info.copy_dest_info.copy_dest_format),
+        resolve_info.rb_copy_control.color_clear_enable || resolve_info.rb_copy_control.depth_clear_enable);
+  }
+
   DeferredCommandList& command_list = command_processor_.GetDeferredCommandList();
 
   // Copying.
@@ -1220,6 +1238,37 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           if (!DumpRenderTargets(dump_base, dump_row_length_used, dump_rows, dump_pitch)) {
             REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for resolve");
             return false;
+          }
+        }
+        // Ambient occlusion: a large, non-square depth resolve
+        // is the scene depth (square ones are shadow maps). The dump above
+        // left the owning host render target readable.
+        if (resolve_info.IsCopyingDepth()) {
+          uint32_t width = uint32_t(resolve_info.coordinate_info.width_div_8) * 8;
+          uint32_t height = uint32_t(resolve_info.height_div_8) * 8;
+          if (width >= 640 && height >= 360 && width != height) {
+            for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+              auto* rt = static_cast<D3D12RenderTarget*>(rectangle.render_target);
+              if (REXCVAR_GET(log_resolves) > 0 && rt) {
+                REXGPU_INFO("[resolve] depth rt: is_depth {} msaa {} base {} pitch {} (resolve base {})",
+                            bool(rt->key().is_depth), uint32_t(rt->key().msaa_samples),
+                            uint32_t(rt->key().base_tiles), uint32_t(rt->key().pitch_tiles_at_32bpp),
+                            resolve_info.depth_original_base);
+              }
+              if (!rt || !rt->key().is_depth ||
+                  rt->key().base_tiles != resolve_info.depth_original_base) {
+                continue;
+              }
+              command_processor_.PushTransitionBarrier(
+                  rt->resource(),
+                  rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+              command_processor_.CaptureSceneDepth(rt->resource(), rt->descriptor_srv().GetHandle(),
+                                                   width * draw_resolution_scale_x(),
+                                                   height * draw_resolution_scale_y(),
+                                                   rt->key().msaa_samples != xenos::MsaaSamples::k1X);
+              break;
+            }
           }
         }
       }

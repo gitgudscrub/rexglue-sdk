@@ -25,11 +25,17 @@ cbuffer PostGradeConstants : register(b0) {
   float keep_exposure;  // 0..1, how much the average brightness is restored
   float mean_blend;   // per-frame blend of the brightness average (0..1)
   uint pass_param;    // blur: unused; mean: first frame flag
+  float ao_strength;  // grade: ambient occlusion amount (0..1)
+  uint ao_mode;       // grade: 0 no AO, 1 apply, 2 show AO, 3 show AO depth
+  uint pad0, pad1;
 };
 
 Texture2D<float4> source : register(t0);
 Texture2D<float> luma_in : register(t1);
 Texture2D<float> mean_in : register(t2);
+// Half-res (occlusion, view depth) from post_ao.cs.hlsl, stretched over the
+// frame (the game scales its 3D view to the full output).
+Texture2D<float2> ao_tex : register(t3);
 RWTexture2D<float4> dest : register(u0);
 RWTexture2D<float> mean_out : register(u1);
 // Single-channel destination for the luma passes (same slot as dest; each
@@ -159,6 +165,21 @@ void grade(uint3 id : SV_DispatchThreadID) {
   float2 uv = (float2(id.xy) + 0.5) / float2(size);
   float blurred = luma_in.SampleLevel(linear_clamp, uv, 0.0);
   float mean_luma = mean_in[uint2(0, 0)];
+  if (ao_mode != 0) {
+    float2 ao = ao_tex.SampleLevel(linear_clamp, uv, 0.0);
+    if (ao_mode == 2) {
+      dest[id.xy] = float4(ao.xxx, 1.0);
+      return;
+    }
+    if (ao_mode == 3) {
+      // Bands every doubling of view depth; sky white.
+      float band = ao.y > 50000.0 ? 1.0 : frac(log2(max(ao.y, 1.0)) * 0.5);
+      dest[id.xy] = float4(band.xxx, 1.0);
+      return;
+    }
+    // The frame is gamma-encoded: occlusion is linear light, so ^(1/2.2).
+    c *= pow(saturate(lerp(1.0, ao.x, ao_strength)), 1.0 / 2.2);
+  }
   float3 g = Grade(saturate(c), blurred) * ExposureScale(mean_luma);
   dest[id.xy] = float4(saturate(g), 1.0);
 }

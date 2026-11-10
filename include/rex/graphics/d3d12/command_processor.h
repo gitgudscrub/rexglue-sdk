@@ -626,7 +626,8 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t pass_param;
     float ao_strength;
     uint32_t ao_mode;
-    uint32_t pad[2];
+    float bloom_threshold;
+    float bloom_strength;
   };
   // post_ao.cs.hlsl, same root signature (16 root constants).
   struct PostAoConstants {
@@ -650,6 +651,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     kDestination,
     kMeanOut,
     kAo,
+    kBloom,
 
     kCount,
   };
@@ -659,6 +661,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_blur_v_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_mean_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_grade_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_bloom_down_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_bloom_blur_h_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_bloom_blur_v_pipeline_;
   // All kept in NON_PIXEL_SHADER_RESOURCE between passes and frames.
   // Full-res copy of the gamma-corrected frame (kFxaaSourceTextureFormat).
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_source_texture_;
@@ -666,6 +671,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_luma_textures_[2];
   // 1x1 smoothed average luma (R32_FLOAT).
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_mean_texture_;
+  // Quarter-res R16G16B16A16_FLOAT bloom, ping-pong; result in [0].
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_bloom_textures_[2];
   uint64_t post_grade_submission_ = 0;
   bool post_grade_mean_valid_ = false;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_ao_pipeline_;

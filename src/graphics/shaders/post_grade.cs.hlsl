@@ -8,6 +8,15 @@
 //   mean    average luma of the frame, smoothed over time   (t1 -> u1)
 //   grade   colour + blurred luma + mean -> output          (t0, t1, t2 -> u0)
 //
+// Optional bloom (bloom_strength > 0), run before the grade:
+//
+//   bloom_down    full-res colour -> quarter-res highlights   (t0 -> u0)
+//   bloom_blur_h  quarter-res highlights, horizontal           (t1 -> u0)
+//   bloom_blur_v  same, vertical                               (t1 -> u0)
+//
+// The grade writes perceptual luma to alpha so the SDK's FXAA pass can run
+// on its output (post_aa).
+//
 // The grade adds depth without changing the game's look: a slight dehaze,
 // local contrast ("clarity") from the blurred luma, a gentle S-curve,
 // vibrance for muted colours, a light 3x3 sharpen, and an exposure fix so
@@ -27,7 +36,8 @@ cbuffer PostGradeConstants : register(b0) {
   uint pass_param;    // blur: unused; mean: first frame flag
   float ao_strength;  // grade: ambient occlusion amount (0..1)
   uint ao_mode;       // grade: 0 no AO, 1 apply, 2 show AO, 3 show AO depth
-  uint pad0, pad1;
+  float bloom_threshold;  // highlight luma where bloom starts
+  float bloom_strength;   // 0 = no bloom
 };
 
 Texture2D<float4> source : register(t0);
@@ -36,6 +46,9 @@ Texture2D<float> mean_in : register(t2);
 // Half-res (occlusion, view depth) from post_ao.cs.hlsl, stretched over the
 // frame (the game scales its 3D view to the full output).
 Texture2D<float2> ao_tex : register(t3);
+// Bloom: blur input (same slot as luma_in) and the result for the grade.
+Texture2D<float4> bloom_in : register(t1);
+Texture2D<float4> bloom_tex : register(t4);
 RWTexture2D<float4> dest : register(u0);
 RWTexture2D<float> mean_out : register(u1);
 // Single-channel destination for the luma passes (same slot as dest; each
@@ -118,6 +131,47 @@ void mean(uint3 gtid : SV_GroupThreadID) {
   }
 }
 
+// --- bloom -------------------------------------------------------------------
+[numthreads(8, 8, 1)]
+void bloom_down(uint3 id : SV_DispatchThreadID) {
+  if (any(id.xy >= small_size)) return;
+  float3 sum = 0.0;
+  uint2 base = id.xy * 4;
+  for (uint y = 0; y < 4; ++y) {
+    for (uint x = 0; x < 4; ++x) {
+      sum += source[min(base + uint2(x, y), size - 1)].rgb;
+    }
+  }
+  float3 c = sum / 16.0;
+  // Soft knee above the threshold, so only real highlights glow.
+  float k = saturate((Luma(c) - bloom_threshold) / max(1.0 - bloom_threshold, 1e-3));
+  dest[id.xy] = float4(c * (k * k), 1.0);
+}
+
+float3 BloomBlurAlong(int2 p, int2 dir) {
+  float3 sum = 0.0;
+  float wsum = 0.0;
+  for (int i = -kRadius; i <= kRadius; ++i) {
+    int2 q = clamp(p + dir * i, int2(0, 0), int2(small_size) - 1);
+    float w = Gauss(i);
+    sum += bloom_in[q].rgb * w;
+    wsum += w;
+  }
+  return sum / wsum;
+}
+
+[numthreads(8, 8, 1)]
+void bloom_blur_h(uint3 id : SV_DispatchThreadID) {
+  if (any(id.xy >= small_size)) return;
+  dest[id.xy] = float4(BloomBlurAlong(int2(id.xy), int2(1, 0)), 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void bloom_blur_v(uint3 id : SV_DispatchThreadID) {
+  if (any(id.xy >= small_size)) return;
+  dest[id.xy] = float4(BloomBlurAlong(int2(id.xy), int2(0, 1)), 1.0);
+}
+
 // --- grade -----------------------------------------------------------------
 float3 Grade(float3 c, float blurred) {
   c = Dehaze(c);
@@ -180,6 +234,11 @@ void grade(uint3 id : SV_DispatchThreadID) {
     // The frame is gamma-encoded: occlusion is linear light, so ^(1/2.2).
     c *= pow(saturate(lerp(1.0, ao.x, ao_strength)), 1.0 / 2.2);
   }
-  float3 g = Grade(saturate(c), blurred) * ExposureScale(mean_luma);
-  dest[id.xy] = float4(saturate(g), 1.0);
+  if (bloom_strength > 0.0) {
+    // Screen blend: brightens without clipping.
+    float3 b = saturate(bloom_tex.SampleLevel(linear_clamp, uv, 0.0).rgb * bloom_strength);
+    c = 1.0 - (1.0 - saturate(c)) * (1.0 - b);
+  }
+  float3 g = saturate(Grade(saturate(c), blurred) * ExposureScale(mean_luma));
+  dest[id.xy] = float4(g, dot(g, float3(0.299, 0.587, 0.114)));
 }

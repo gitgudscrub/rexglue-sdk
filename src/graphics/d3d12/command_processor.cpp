@@ -3018,6 +3018,48 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
          ComputeFable2Skinning(*register_file_, *memory_, *vertex_shader, nullptr, written_start,
                                written_length));
   }
+  // Does this draw read a vertex buffer the CPU rewrote recently? (See
+  // dynamic_mesh_buffers_.) Checked before the upload below validates it.
+  bool dynamic_mesh = false;
+  {
+    if (dynamic_mesh_trim_frame_ + 600 < frame_current_) {
+      dynamic_mesh_trim_frame_ = frame_current_;
+      for (auto it = dynamic_mesh_buffers_.begin(); it != dynamic_mesh_buffers_.end();) {
+        if (it->second.last_seen + 600 < frame_current_) {
+          it = dynamic_mesh_buffers_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    const Shader::ConstantRegisterMap& vfetch_map = vertex_shader->constant_register_map();
+    for (uint32_t i = 0; i < rex::countof(vfetch_map.vertex_fetch_bitmap); ++i) {
+      uint32_t bits = vfetch_map.vertex_fetch_bitmap[i];
+      uint32_t j;
+      while (rex::bit_scan_forward(bits, &j)) {
+        bits &= ~(uint32_t(1) << j);
+        xenos::xe_gpu_vertex_fetch_t vfetch = regs.GetVertexFetch(i * 32 + j);
+        if (vfetch.type != xenos::FetchConstantType::kVertex || !vfetch.size) {
+          continue;
+        }
+        uint32_t address = vfetch.address << 2;
+        bool valid = shared_memory_->IsRangeValid(address, vfetch.size << 2);
+        auto it = dynamic_mesh_buffers_.find(address);
+        if (it == dynamic_mesh_buffers_.end()) {
+          dynamic_mesh_buffers_.emplace(address, DynamicMeshState{frame_current_, 0});
+          continue;
+        }
+        it->second.last_seen = frame_current_;
+        if (!valid) {
+          it->second.last_dynamic = frame_current_;
+        }
+        if (it->second.last_dynamic &&
+            it->second.last_dynamic + kDynamicMeshHoldFrames >= frame_current_) {
+          dynamic_mesh = true;
+        }
+      }
+    }
+  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
   // Pixel shader analysis.
@@ -3214,7 +3256,8 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   UpdateSystemConstantValues(memexport_used, primitive_polygonal,
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
-                             used_texture_mask, normalized_depth_control, normalized_color_mask);
+                             used_texture_mask, normalized_depth_control, normalized_color_mask,
+                             dynamic_mesh);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
@@ -4383,7 +4426,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
     xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask) {
+    uint32_t normalized_color_mask, bool dynamic_mesh) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -4483,6 +4526,9 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   // Depth format.
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
     flags |= DxbcShaderTranslator::kSysFlag_DepthFloat24;
+  }
+  if (dynamic_mesh) {
+    flags |= DxbcShaderTranslator::kSysFlag_DynamicMesh;
   }
   // Alpha test.
   xenos::CompareFunction alpha_test_function = rb_colorcontrol.alpha_test_enable

@@ -260,6 +260,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
     kSysFlag_ROVDepthWrite = 1u << kSysFlag_ROVDepthWrite_Shift,
     kSysFlag_ROVStencilTest = 1u << kSysFlag_ROVStencilTest_Shift,
     kSysFlag_ROVDepthStencilEarlyWrite = 1u << kSysFlag_ROVDepthStencilEarlyWrite_Shift,
+    // Fable II fork: the draw reads a vertex buffer the CPU rewrote recently
+    // (the game skins its characters on the CPU and uploads them every frame,
+    // while scenery buffers never change). Not used by the translator; read
+    // by the hand-written shader replacements.
+    kSysFlag_DynamicMesh = 1u << 31,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

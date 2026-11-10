@@ -376,7 +376,7 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   const draw_util::ViewportInfo& viewport_info,
                                   uint32_t used_texture_mask,
                                   reg::RB_DEPTHCONTROL normalized_depth_control,
-                                  uint32_t normalized_color_mask);
+                                  uint32_t normalized_color_mask, bool dynamic_mesh);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();
@@ -684,6 +684,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Frame in which post_ao_textures_[0] was last filled (0 = never).
   uint64_t post_ao_frame_ = 0;
   bool post_ao_logged_ = false;
+
+  // Vertex buffers seen in draws, by guest address: when one is seen with
+  // pages the CPU wrote since its last upload, it is dynamic (a skinned
+  // character mesh) and its draws get kSysFlag_DynamicMesh for a while after
+  // (kDynamicMeshHoldFrames), so a character that stops animating keeps its
+  // look. The first sighting of a buffer does not count (nothing is uploaded
+  // yet), so freshly loaded scenery is not flagged.
+  struct DynamicMeshState {
+    uint64_t last_seen;
+    uint64_t last_dynamic;
+  };
+  static constexpr uint64_t kDynamicMeshHoldFrames = 120;
+  std::unordered_map<uint32_t, DynamicMeshState> dynamic_mesh_buffers_;
+  uint64_t dynamic_mesh_trim_frame_ = 0;
   bool InitializePostGrade();
   bool EnsurePostGradeTextures(uint32_t width, uint32_t height);
   void ReleasePostGradeTextures();

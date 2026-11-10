@@ -272,6 +272,9 @@ class PipelineCache {
   D3D12Shader* LoadShader(xenos::ShaderType shader_type, const uint32_t* host_address,
                           uint32_t dword_count, uint64_t data_hash);
 
+  // shader_highlight / shader_replace_dir, right after translation.
+  static void ApplyShaderOverrides(D3D12Shader::D3D12Translation& translation);
+
   // Can be called from multiple threads.
   bool TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                D3D12Shader::D3D12Translation& translation,

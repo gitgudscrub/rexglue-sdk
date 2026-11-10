@@ -779,6 +779,13 @@ class Shader {
     // Translated shader binary (or text).
     const std::vector<uint8_t>& translated_binary() const { return translated_binary_; }
 
+    // Swaps in a different host binary after translation (shader_highlight,
+    // shader_replace_dir). It must declare the same bindings as the
+    // translated one, or none.
+    void ReplaceTranslatedBinary(std::vector<uint8_t> binary) {
+      translated_binary_ = std::move(binary);
+    }
+
     // Gets the translated shader binary as a string.
     // This is only valid if it is actually text.
     std::string GetTranslatedBinaryString() const;

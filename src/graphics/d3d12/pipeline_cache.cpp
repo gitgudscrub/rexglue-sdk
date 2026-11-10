@@ -15,7 +15,12 @@
 #include <chrono>
 #include <atomic>
 #include <cinttypes>
+#include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -90,6 +95,14 @@ struct PipelineTimer {
 REXCVAR_DEFINE_BOOL(d3d12_tessellation_wireframe, false, "GPU/D3D12",
                     "Render tessellation as wireframe");
 
+REXCVAR_DEFINE_STRING(shader_highlight, "", "GPU/D3D12",
+                      "Diagnostic: comma-separated pixel shader hashes (16 hex digits) to draw "
+                      "in solid magenta. Read when shaders are translated (restart)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+REXCVAR_DEFINE_STRING(shader_replace_dir, "", "GPU/D3D12",
+                      "Folder of replacement host shaders: <HASH>.dxbc replaces the translated "
+                      "shader with that ucode hash (all variants). Read at translation (restart)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 REXCVAR_DEFINE_STRING(depth_bias_shader, "", "GPU/D3D12",
                       "Guest pixel shader ucode hash (hex) whose draws get "
                       "depth_bias_shader_units of extra host depth bias, for geometry that "
@@ -104,6 +117,14 @@ namespace rex::graphics::d3d12 {
 
 // Generated with `xb buildshaders`.
 namespace shaders {
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_0_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_1_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_2_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_3_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_4_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_5_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_6_ps.h"
+#include "../shaders/bytecode/d3d12_5_1/shader_highlight_7_ps.h"
 #include "../shaders/bytecode/d3d12_5_1/adaptive_quad_hs.h"
 #include "../shaders/bytecode/d3d12_5_1/adaptive_triangle_hs.h"
 #include "../shaders/bytecode/d3d12_5_1/continuous_quad_1cp_hs.h"
@@ -1093,6 +1114,61 @@ bool PipelineCache::ConfigurePipeline(
   return true;
 }
 
+// shader_highlight / shader_replace_dir (see the cvars).
+void PipelineCache::ApplyShaderOverrides(D3D12Shader::D3D12Translation& translation) {
+  const Shader& shader = translation.shader();
+  char hash_text[17];
+  std::snprintf(hash_text, sizeof(hash_text), "%016llX",
+                static_cast<unsigned long long>(shader.ucode_data_hash()));
+  const std::string& replace_dir = REXCVAR_GET(shader_replace_dir);
+  static std::atomic<bool> logged_dir{false};
+  if (!logged_dir.exchange(true)) {
+    std::error_code ec;
+    REXGPU_INFO("Shader replacements: dir '{}' ({})", replace_dir,
+                replace_dir.empty() ? "off"
+                : std::filesystem::is_directory(replace_dir, ec) ? "found" : "NOT FOUND");
+  }
+  if (!replace_dir.empty()) {
+    std::filesystem::path path = std::filesystem::path(replace_dir) / (std::string(hash_text) + ".dxbc");
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(path, ec)) {
+      std::ifstream file(path, std::ios::binary);
+      std::vector<uint8_t> binary((std::istreambuf_iterator<char>(file)),
+                                  std::istreambuf_iterator<char>());
+      if (binary.size() >= 32 && !std::memcmp(binary.data(), "DXBC", 4)) {
+        translation.ReplaceTranslatedBinary(std::move(binary));
+        REXGPU_INFO("Shader {} replaced by {}", hash_text, path.string());
+        return;
+      }
+      REXGPU_ERROR("Shader replacement {} is not a DXBC file", path.string());
+    }
+  }
+  if (shader.type() == xenos::ShaderType::kPixel) {
+    const std::string& list = REXCVAR_GET(shader_highlight);
+    if (!list.empty()) {
+      std::string upper = list;
+      for (char& c : upper) c = char(std::toupper(static_cast<unsigned char>(c)));
+      size_t found = upper.find(hash_text);
+      if (found != std::string::npos) {
+        // Colour = position in the list.
+        size_t index = size_t(std::count(upper.begin(), upper.begin() + found, ',')) % 8;
+        static const std::pair<const uint8_t*, size_t> kHighlight[8] = {
+            {shaders::shader_highlight_0_ps, sizeof(shaders::shader_highlight_0_ps)},
+            {shaders::shader_highlight_1_ps, sizeof(shaders::shader_highlight_1_ps)},
+            {shaders::shader_highlight_2_ps, sizeof(shaders::shader_highlight_2_ps)},
+            {shaders::shader_highlight_3_ps, sizeof(shaders::shader_highlight_3_ps)},
+            {shaders::shader_highlight_4_ps, sizeof(shaders::shader_highlight_4_ps)},
+            {shaders::shader_highlight_5_ps, sizeof(shaders::shader_highlight_5_ps)},
+            {shaders::shader_highlight_6_ps, sizeof(shaders::shader_highlight_6_ps)},
+            {shaders::shader_highlight_7_ps, sizeof(shaders::shader_highlight_7_ps)}};
+        translation.ReplaceTranslatedBinary(std::vector<uint8_t>(
+            kHighlight[index].first, kHighlight[index].first + kHighlight[index].second));
+        REXGPU_INFO("Pixel shader {} highlighted (colour {})", hash_text, index);
+      }
+    }
+  }
+}
+
 bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
                                             D3D12Shader::D3D12Translation& translation,
                                             IDxbcConverter* dxbc_converter, IDxcUtils* dxc_utils,
@@ -1107,6 +1183,7 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
   }
+  ApplyShaderOverrides(translation);
 
   const char* host_shader_type;
   if (shader.type() == xenos::ShaderType::kVertex) {

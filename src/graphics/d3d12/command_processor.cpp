@@ -13,6 +13,7 @@
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
+#include <map>
 #include <utility>
 
 #include <rex/assert.h>
@@ -57,6 +58,20 @@ REXCVAR_DEFINE_DOUBLE(post_grade_keep_exposure, 1.0, "GPU/D3D12",
                       "Grade: how much of the original average brightness is kept (0..1)")
     .range(0.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(log_frame_shaders, 0, "GPU/D3D12",
+                     "Diagnostic: log every vertex/pixel shader pair drawn in the next N frames, "
+                     "with draw counts, in first-drawn order")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+namespace {
+// log_frame_shaders: (vertex hash, pixel hash) -> (first draw index, draws).
+struct FrameShaderLog {
+  std::map<std::pair<uint64_t, uint64_t>, std::pair<uint32_t, uint32_t>> pairs;
+  uint32_t draws = 0;
+};
+FrameShaderLog frame_shader_log;
+
+}  // namespace
+
 REXCVAR_DEFINE_BOOL(post_bloom, false, "GPU/D3D12",
                     "Modern-graphics bloom: a soft glow around highlights, added by the colour "
                     "grade (needs post_grade)")
@@ -2043,6 +2058,21 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  if (REXCVAR_GET(log_frame_shaders) > 0) {
+    std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> order;
+    for (const auto& [key, value] : frame_shader_log.pairs) {
+      order.emplace_back(value.first, key);
+    }
+    std::sort(order.begin(), order.end());
+    REXGPU_INFO("[frame-shaders] frame {}: {} draws, {} shader pairs", frame_current_,
+                frame_shader_log.draws, order.size());
+    for (const auto& [first, key] : order) {
+      REXGPU_INFO("[frame-shaders]   first {:5} draws {:4} vs {:016X} ps {:016X}", first,
+                  frame_shader_log.pairs[key].second, key.first, key.second);
+    }
+    frame_shader_log = {};
+    REXCVAR_SET(log_frame_shaders, REXCVAR_GET(log_frame_shaders) - 1);
+  }
   vertex_buffers_in_sync_[0] = 0;
   vertex_buffers_in_sync_[1] = 0;
 
@@ -3018,6 +3048,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       // This draw has no effect.
       return true;
     }
+  }
+  if (REXCVAR_GET(log_frame_shaders) > 0) {
+    auto key = std::make_pair(vertex_shader->ucode_data_hash(),
+                              pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0));
+    auto it = frame_shader_log.pairs.try_emplace(key, frame_shader_log.draws, 0).first;
+    ++it->second.second;
+    ++frame_shader_log.draws;
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;

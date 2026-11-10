@@ -603,6 +603,49 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> fxaa_extreme_pipeline_;
 
+  // Modern-graphics colour grade, run on the guest output after the gamma
+  // ramp when the post_grade cvar is on (src/graphics/shaders/post_grade.cs.hlsl).
+  struct PostGradeConstants {
+    uint32_t size[2];
+    uint32_t small_size[2];
+    float dehaze;
+    float clarity;
+    float contrast;
+    float vibrance;
+    float sharpen;
+    float keep_exposure;
+    float mean_blend;
+    uint32_t pass_param;
+  };
+  enum class PostGradeRootParameter : UINT {
+    kConstants,
+    kSource,
+    kLuma,
+    kMean,
+    kDestination,
+    kMeanOut,
+
+    kCount,
+  };
+  Microsoft::WRL::ComPtr<ID3D12RootSignature> post_grade_root_signature_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_down_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_blur_h_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_blur_v_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_mean_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_grade_pipeline_;
+  // All kept in NON_PIXEL_SHADER_RESOURCE between passes and frames.
+  // Full-res copy of the gamma-corrected frame (kFxaaSourceTextureFormat).
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_source_texture_;
+  // Quarter-res luma, ping-ponged by the blur (R16_FLOAT).
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_luma_textures_[2];
+  // 1x1 smoothed average luma (R32_FLOAT).
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_mean_texture_;
+  uint64_t post_grade_submission_ = 0;
+  bool post_grade_mean_valid_ = false;
+  bool InitializePostGrade();
+  bool EnsurePostGradeTextures(uint32_t width, uint32_t height);
+  void ReleasePostGradeTextures();
+
   struct ResolveDownscaleConstants {
     uint32_t scale_x;
     uint32_t scale_y;

@@ -34,6 +34,30 @@
 #include <rex/ui/d3d12/d3d12_presenter.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DEFINE_BOOL(post_grade, false, "GPU/D3D12",
+                    "Modern-graphics colour grade after the gamma ramp (dehaze, local "
+                    "contrast, contrast curve, vibrance, sharpen). Not combined with FXAA.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_dehaze, 0.02, "GPU/D3D12", "Grade: black floor pulled down")
+    .range(0.0, 0.2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_clarity, 0.45, "GPU/D3D12", "Grade: local contrast amount")
+    .range(0.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_contrast, 0.10, "GPU/D3D12", "Grade: contrast curve amount")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_vibrance, 0.15, "GPU/D3D12", "Grade: muted-colour saturation")
+    .range(-1.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_sharpen, 0.20, "GPU/D3D12", "Grade: 3x3 sharpen amount")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_keep_exposure, 1.0, "GPU/D3D12",
+                      "Grade: how much of the original average brightness is kept (0..1)")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
@@ -92,6 +116,12 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/fxaa_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/fxaa_extreme_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/resolve_downscale_cs.h"
+// Built with fxc from post_grade.cs.hlsl (one /E entry point per header).
+#include "../shaders/bytecode/d3d12_5_1/post_grade_blur_h_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_blur_v_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_down_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_grade_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_mean_cs.h"
 }  // namespace shaders
 
 D3D12CommandProcessor::D3D12CommandProcessor(D3D12GraphicsSystem* graphics_system,
@@ -1456,6 +1486,10 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to create the FXAA compute pipeline");
     return false;
   }
+  if (!InitializePostGrade()) {
+    // Not fatal: the grade is optional.
+    REXGPU_ERROR("Failed to create the colour grade pipelines; post_grade is unavailable");
+  }
   *(fxaa_extreme_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
       device, shaders::fxaa_extreme_cs, sizeof(shaders::fxaa_extreme_cs),
       fxaa_root_signature_.Get());
@@ -1723,6 +1757,15 @@ void D3D12CommandProcessor::ShutdownContext() {
 
   fxaa_source_texture_submission_ = 0;
   fxaa_source_texture_.Reset();
+
+  post_grade_submission_ = 0;
+  ReleasePostGradeTextures();
+  post_grade_grade_pipeline_.Reset();
+  post_grade_mean_pipeline_.Reset();
+  post_grade_blur_v_pipeline_.Reset();
+  post_grade_blur_h_pipeline_.Reset();
+  post_grade_down_pipeline_.Reset();
+  post_grade_root_signature_.Reset();
 
   fxaa_extreme_pipeline_.Reset();
   fxaa_pipeline_.Reset();
@@ -2076,6 +2119,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           }
         }
 
+        bool use_post_grade = !use_fxaa && REXCVAR_GET(post_grade) && post_grade_grade_pipeline_ &&
+                              EnsurePostGradeTextures(guest_output_width, guest_output_height);
+
         // This is according to D3D::InitializePresentationParameters from a
         // game executable, which initializes the 256-entry table gamma ramp for
         // 8_8_8_8 output and the PWL gamma ramp for 2_10_10_10.
@@ -2086,7 +2132,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10 ||
             frontbuffer_format == xenos::TextureFormat::k_2_10_10_10_AS_16_16_16_16;
 
-        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa);
+        context.SetIs8bpc(!use_pwl_gamma_ramp && !use_fxaa && !use_post_grade);
 
         // Upload the new gamma ramp, using the upload buffer for the current
         // frame (will close the frame after this anyway, so can't write
@@ -2155,12 +2201,16 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         if (use_fxaa) {
           fxaa_source_texture_submission_ = submission_current_;
         }
+        if (use_post_grade) {
+          post_grade_submission_ = submission_current_;
+        }
 
         ID3D12Resource* apply_gamma_dest =
-            use_fxaa ? fxaa_source_texture_.Get() : guest_output_resource;
+            use_fxaa ? fxaa_source_texture_.Get()
+                     : (use_post_grade ? post_grade_source_texture_.Get() : guest_output_resource);
         D3D12_RESOURCE_STATES apply_gamma_dest_initial_state =
-            use_fxaa ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
-                     : ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
+            (use_fxaa || use_post_grade) ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+                                         : ui::d3d12::D3D12Presenter::kGuestOutputInternalState;
         static_cast<ui::d3d12::D3D12Presenter::D3D12GuestOutputRefreshContext&>(context)
             .resource_uav_capable();
         PushTransitionBarrier(apply_gamma_dest, apply_gamma_dest_initial_state,
@@ -2168,8 +2218,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
         // From now on, even in case of failure, apply_gamma_dest must be
         // transitioned back to apply_gamma_dest_initial_state!
         D3D12_UNORDERED_ACCESS_VIEW_DESC apply_gamma_dest_uav_desc;
-        apply_gamma_dest_uav_desc.Format =
-            use_fxaa ? kFxaaSourceTextureFormat : ui::d3d12::D3D12Presenter::kGuestOutputFormat;
+        apply_gamma_dest_uav_desc.Format = (use_fxaa || use_post_grade)
+                                               ? kFxaaSourceTextureFormat
+                                               : ui::d3d12::D3D12Presenter::kGuestOutputFormat;
         apply_gamma_dest_uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
         apply_gamma_dest_uav_desc.Texture2D.MipSlice = 0;
         apply_gamma_dest_uav_desc.Texture2D.PlaneSlice = 0;
@@ -2278,6 +2329,117 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             PushTransitionBarrier(guest_output_resource, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
                                   ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
           }
+        } else if (use_post_grade) {
+          PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                apply_gamma_dest_initial_state);
+          // t0 source, t1 luma, t2 mean, u0 destination, u1 mean out, per pass:
+          // down (t0 u0), blur_h (t1 u0), blur_v (t1 u0), mean (t1 u1),
+          // grade (t0 t1 t2 u0).
+          ui::d3d12::util::DescriptorCpuGpuHandlePair d[12];
+          if (!RequestOneUseSingleViewDescriptors(12, d)) {
+            // Show the ungraded frame.
+            PushTransitionBarrier(apply_gamma_dest, apply_gamma_dest_initial_state,
+                                  D3D12_RESOURCE_STATE_COPY_SOURCE);
+            PushTransitionBarrier(guest_output_resource,
+                                  ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                                  D3D12_RESOURCE_STATE_COPY_DEST);
+            SubmitBarriers();
+            deferred_command_list_.D3DCopyResource(guest_output_resource, apply_gamma_dest);
+            PushTransitionBarrier(apply_gamma_dest, D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                  apply_gamma_dest_initial_state);
+            PushTransitionBarrier(guest_output_resource, D3D12_RESOURCE_STATE_COPY_DEST,
+                                  ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
+          } else {
+            ID3D12Resource* luma0 = post_grade_luma_textures_[0].Get();
+            ID3D12Resource* luma1 = post_grade_luma_textures_[1].Get();
+            ID3D12Resource* mean_texture = post_grade_mean_texture_.Get();
+            auto srv = [&](ID3D12Resource* r, DXGI_FORMAT f, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+              D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+              desc.Format = f;
+              desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+              desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+              desc.Texture2D.MipLevels = 1;
+              device->CreateShaderResourceView(r, &desc, h);
+            };
+            auto uav = [&](ID3D12Resource* r, DXGI_FORMAT f, D3D12_CPU_DESCRIPTOR_HANDLE h) {
+              D3D12_UNORDERED_ACCESS_VIEW_DESC desc = {};
+              desc.Format = f;
+              desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+              device->CreateUnorderedAccessView(r, nullptr, &desc, h);
+            };
+            srv(apply_gamma_dest, kFxaaSourceTextureFormat, d[0].first);
+            uav(luma0, DXGI_FORMAT_R16_FLOAT, d[1].first);
+            srv(luma0, DXGI_FORMAT_R16_FLOAT, d[2].first);
+            uav(luma1, DXGI_FORMAT_R16_FLOAT, d[3].first);
+            srv(luma1, DXGI_FORMAT_R16_FLOAT, d[4].first);
+            uav(luma0, DXGI_FORMAT_R16_FLOAT, d[5].first);
+            srv(luma0, DXGI_FORMAT_R16_FLOAT, d[6].first);
+            uav(mean_texture, DXGI_FORMAT_R32_FLOAT, d[7].first);
+            srv(apply_gamma_dest, kFxaaSourceTextureFormat, d[8].first);
+            srv(luma0, DXGI_FORMAT_R16_FLOAT, d[9].first);
+            srv(mean_texture, DXGI_FORMAT_R32_FLOAT, d[10].first);
+            uav(guest_output_resource, ui::d3d12::D3D12Presenter::kGuestOutputFormat,
+                d[11].first);
+
+            PostGradeConstants constants = {};
+            constants.size[0] = guest_output_width;
+            constants.size[1] = guest_output_height;
+            constants.small_size[0] = (guest_output_width + 3) / 4;
+            constants.small_size[1] = (guest_output_height + 3) / 4;
+            constants.dehaze = float(REXCVAR_GET(post_grade_dehaze));
+            constants.clarity = float(REXCVAR_GET(post_grade_clarity));
+            constants.contrast = float(REXCVAR_GET(post_grade_contrast));
+            constants.vibrance = float(REXCVAR_GET(post_grade_vibrance));
+            constants.sharpen = float(REXCVAR_GET(post_grade_sharpen));
+            constants.keep_exposure = float(REXCVAR_GET(post_grade_keep_exposure));
+            constants.mean_blend = 0.05f;
+            constants.pass_param = post_grade_mean_valid_ ? 0 : 1;
+            post_grade_mean_valid_ = true;
+
+            deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());
+            deferred_command_list_.D3DSetComputeRoot32BitConstants(
+                UINT(PostGradeRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t),
+                &constants, 0);
+            auto table = [&](PostGradeRootParameter p, const ui::d3d12::util::DescriptorCpuGpuHandlePair& h) {
+              deferred_command_list_.D3DSetComputeRootDescriptorTable(UINT(p), h.second);
+            };
+            const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+            const D3D12_RESOURCE_STATES kWrite = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+            uint32_t small_groups_x = (constants.small_size[0] + 7) / 8;
+            uint32_t small_groups_y = (constants.small_size[1] + 7) / 8;
+            auto pass = [&](ID3D12PipelineState* pipeline, ID3D12Resource* written,
+                            D3D12_RESOURCE_STATES written_rest, uint32_t gx, uint32_t gy) {
+              PushTransitionBarrier(written, written_rest, kWrite);
+              SetExternalPipeline(pipeline);
+              SubmitBarriers();
+              deferred_command_list_.D3DDispatch(gx, gy, 1);
+              PushTransitionBarrier(written, kWrite, written_rest);
+            };
+            // down: source -> luma0
+            table(PostGradeRootParameter::kSource, d[0]);
+            table(PostGradeRootParameter::kDestination, d[1]);
+            pass(post_grade_down_pipeline_.Get(), luma0, kRead, small_groups_x, small_groups_y);
+            // blur_h: luma0 -> luma1
+            table(PostGradeRootParameter::kLuma, d[2]);
+            table(PostGradeRootParameter::kDestination, d[3]);
+            pass(post_grade_blur_h_pipeline_.Get(), luma1, kRead, small_groups_x, small_groups_y);
+            // blur_v: luma1 -> luma0
+            table(PostGradeRootParameter::kLuma, d[4]);
+            table(PostGradeRootParameter::kDestination, d[5]);
+            pass(post_grade_blur_v_pipeline_.Get(), luma0, kRead, small_groups_x, small_groups_y);
+            // mean: luma0 -> mean
+            table(PostGradeRootParameter::kLuma, d[6]);
+            table(PostGradeRootParameter::kMeanOut, d[7]);
+            pass(post_grade_mean_pipeline_.Get(), mean_texture, kRead, 1, 1);
+            // grade: source + luma0 + mean -> guest output
+            table(PostGradeRootParameter::kSource, d[8]);
+            table(PostGradeRootParameter::kLuma, d[9]);
+            table(PostGradeRootParameter::kMean, d[10]);
+            table(PostGradeRootParameter::kDestination, d[11]);
+            pass(post_grade_grade_pipeline_.Get(), guest_output_resource,
+                 ui::d3d12::D3D12Presenter::kGuestOutputInternalState,
+                 (guest_output_width + 15) / 16, (guest_output_height + 7) / 8);
+          }
         } else {
           assert_true(apply_gamma_dest_initial_state ==
                       ui::d3d12::D3D12Presenter::kGuestOutputInternalState);
@@ -2296,6 +2458,126 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
   // End the frame even if did not present for any reason (the image refresher
   // was not called), to prevent leaking per-frame resources.
   EndSubmission(true);
+}
+
+bool D3D12CommandProcessor::InitializePostGrade() {
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  D3D12_ROOT_PARAMETER parameters[UINT(PostGradeRootParameter::kCount)];
+  D3D12_DESCRIPTOR_RANGE ranges[UINT(PostGradeRootParameter::kCount)];
+  parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+  parameters[0].Constants.ShaderRegister = 0;
+  parameters[0].Constants.RegisterSpace = 0;
+  parameters[0].Constants.Num32BitValues = sizeof(PostGradeConstants) / sizeof(uint32_t);
+  parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  // kSource t0, kLuma t1, kMean t2, kDestination u0, kMeanOut u1.
+  const struct {
+    D3D12_DESCRIPTOR_RANGE_TYPE type;
+    UINT reg;
+  } tables[] = {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1}};
+  for (UINT i = 1; i < UINT(PostGradeRootParameter::kCount); ++i) {
+    D3D12_DESCRIPTOR_RANGE& range = ranges[i];
+    range.RangeType = tables[i - 1].type;
+    range.NumDescriptors = 1;
+    range.BaseShaderRegister = tables[i - 1].reg;
+    range.RegisterSpace = 0;
+    range.OffsetInDescriptorsFromTableStart = 0;
+    parameters[i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[i].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[i].DescriptorTable.pDescriptorRanges = &range;
+    parameters[i].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  }
+  D3D12_STATIC_SAMPLER_DESC sampler = {};
+  sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+  sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+  sampler.MaxAnisotropy = 1;
+  sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
+  sampler.ShaderRegister = 0;
+  sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  D3D12_ROOT_SIGNATURE_DESC desc;
+  desc.NumParameters = UINT(PostGradeRootParameter::kCount);
+  desc.pParameters = parameters;
+  desc.NumStaticSamplers = 1;
+  desc.pStaticSamplers = &sampler;
+  desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
+  *(post_grade_root_signature_.ReleaseAndGetAddressOf()) =
+      ui::d3d12::util::CreateRootSignature(provider, desc);
+  if (!post_grade_root_signature_) {
+    return false;
+  }
+  ID3D12RootSignature* rs = post_grade_root_signature_.Get();
+#define REX_POST_GRADE_PIPELINE(member, bytecode)                                            \
+  *(member.ReleaseAndGetAddressOf()) =                                                       \
+      ui::d3d12::util::CreateComputePipeline(device, shaders::bytecode, sizeof(shaders::bytecode), rs); \
+  if (!member) return false;
+  REX_POST_GRADE_PIPELINE(post_grade_down_pipeline_, post_grade_down_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_blur_h_pipeline_, post_grade_blur_h_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_blur_v_pipeline_, post_grade_blur_v_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_mean_pipeline_, post_grade_mean_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_grade_pipeline_, post_grade_grade_cs)
+#undef REX_POST_GRADE_PIPELINE
+  return true;
+}
+
+void D3D12CommandProcessor::ReleasePostGradeTextures() {
+  ID3D12Resource* textures[] = {post_grade_source_texture_.Get(), post_grade_luma_textures_[0].Get(),
+                                post_grade_luma_textures_[1].Get(), post_grade_mean_texture_.Get()};
+  for (ID3D12Resource* texture : textures) {
+    if (texture && submission_completed_ < post_grade_submission_) {
+      texture->AddRef();
+      resources_for_deletion_.emplace_back(post_grade_submission_, texture);
+    }
+  }
+  post_grade_source_texture_.Reset();
+  post_grade_luma_textures_[0].Reset();
+  post_grade_luma_textures_[1].Reset();
+  post_grade_mean_texture_.Reset();
+  post_grade_mean_valid_ = false;
+}
+
+bool D3D12CommandProcessor::EnsurePostGradeTextures(uint32_t width, uint32_t height) {
+  if (post_grade_source_texture_) {
+    D3D12_RESOURCE_DESC existing = post_grade_source_texture_->GetDesc();
+    if (existing.Width == width && existing.Height == height) {
+      return true;
+    }
+    ReleasePostGradeTextures();
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  auto create = [&](uint32_t w, uint32_t h, DXGI_FORMAT format,
+                    Microsoft::WRL::ComPtr<ID3D12Resource>& out) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = w;
+    desc.Height = h;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return SUCCEEDED(device->CreateCommittedResource(
+        &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, nullptr, IID_PPV_ARGS(&out)));
+  };
+  uint32_t small_width = (width + 3) / 4, small_height = (height + 3) / 4;
+  if (!create(width, height, kFxaaSourceTextureFormat, post_grade_source_texture_) ||
+      !create(small_width, small_height, DXGI_FORMAT_R16_FLOAT, post_grade_luma_textures_[0]) ||
+      !create(small_width, small_height, DXGI_FORMAT_R16_FLOAT, post_grade_luma_textures_[1]) ||
+      !create(1, 1, DXGI_FORMAT_R32_FLOAT, post_grade_mean_texture_)) {
+    REXGPU_ERROR("Failed to create the colour grade textures");
+    ReleasePostGradeTextures();
+    return false;
+  }
+  post_grade_mean_valid_ = false;
+  return true;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {

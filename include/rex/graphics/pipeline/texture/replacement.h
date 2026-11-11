@@ -11,6 +11,11 @@
  * Pack layout (under the texture_pack_root cvar):
  *   dump/<hash>_<width>x<height>_<format>.dds   written when texture_dump is on
  *   replace/<any subfolders>/<hash>....dds      loaded in place of the original
+ *   replace/<any subfolders>/<hash>....edds     the same, encrypted with a key
+ *                                               derived from the original
+ *                                               texture (see LoadKeyedDds in
+ *                                               replacement.cpp), so a pack
+ *                                               only opens next to the game
  * Only the first 16 characters of a replacement file name (the hash) matter,
  * so tools can keep the rest of the dump name or add their own suffixes.
  *
@@ -115,6 +120,9 @@ class TextureReplacer {
     std::filesystem::path path;
     // Null if the file couldn't be read.
     std::unique_ptr<DdsImage> image;
+    // The file is a keyed (.edds) replacement that did not open with this
+    // texture's key: made from different game data.
+    bool bad_key = false;
   };
   // Moves out the loads finished since the last call.
   void CollectLoaded(std::vector<LoadedImage>& out);

@@ -21,6 +21,15 @@
 #include <rex/filesystem.h>
 #include <rex/hash.h>
 #include <rex/logging.h>
+#include <rex/platform.h>
+
+#if REX_PLATFORM_WIN32
+#include <windows.h>
+
+#include <bcrypt.h>
+#endif
+
+#include "thirdparty/crypto/sha256.h"
 
 REXCVAR_DEFINE_STRING(texture_pack_root, "textures", "GPU",
                       "Texture pack folder: dump/ receives dumped textures, replace/ holds "
@@ -342,27 +351,40 @@ uint32_t DdsImage::MipRowBytes(uint32_t mip) const {
   return (block_compressed ? (w + 3) / 4 : w) * bytes_per_block;
 }
 
-bool LoadDds(const std::filesystem::path& path, DdsImage& image_out) {
+namespace {
+
+bool ReadFile(const std::filesystem::path& path, std::vector<uint8_t>& out) {
   std::ifstream file(path, std::ios::binary | std::ios::ate);
   if (!file) {
     return false;
   }
   std::streamoff file_size = file.tellg();
-  file.seekg(0);
-  uint32_t magic = 0;
-  DdsHeader header = {};
-  if (file_size < std::streamoff(sizeof(magic) + sizeof(header))) {
+  if (file_size < 0) {
     return false;
   }
-  file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-  file.read(reinterpret_cast<char*>(&header), sizeof(header));
-  if (!file || magic != kDdsMagic || header.size != sizeof(DdsHeader)) {
+  file.seekg(0);
+  out.resize(size_t(file_size));
+  file.read(reinterpret_cast<char*>(out.data()), std::streamsize(out.size()));
+  return bool(file);
+}
+
+}  // namespace
+
+bool ParseDds(const uint8_t* file_data, size_t file_size, DdsImage& image_out) {
+  uint32_t magic = 0;
+  DdsHeader header = {};
+  if (file_size < sizeof(magic) + sizeof(header)) {
+    return false;
+  }
+  std::memcpy(&magic, file_data, sizeof(magic));
+  std::memcpy(&header, file_data + sizeof(magic), sizeof(header));
+  if (magic != kDdsMagic || header.size != sizeof(DdsHeader)) {
     return false;
   }
   if (header.caps2 & (kDdsCaps2Cubemap | kDdsCaps2Volume)) {
     return false;
   }
-  std::streamoff data_offset = sizeof(magic) + sizeof(header);
+  size_t data_offset = sizeof(magic) + sizeof(header);
 
   uint32_t dxgi_format = 0;
   const DdsPixelFormat& pf = header.pixel_format;
@@ -389,8 +411,11 @@ bool LoadDds(const std::filesystem::path& path, DdsImage& image_out) {
         break;
       case FourCC('D', 'X', '1', '0'): {
         DdsHeaderDx10 header_dx10 = {};
-        file.read(reinterpret_cast<char*>(&header_dx10), sizeof(header_dx10));
-        if (!file || header_dx10.resource_dimension != kD3D10ResourceDimensionTexture2D ||
+        if (file_size < data_offset + sizeof(header_dx10)) {
+          return false;
+        }
+        std::memcpy(&header_dx10, file_data + data_offset, sizeof(header_dx10));
+        if (header_dx10.resource_dimension != kD3D10ResourceDimensionTexture2D ||
             header_dx10.array_size > 1 || (header_dx10.misc_flag & 0x4 /* cube */)) {
           return false;
         }
@@ -442,15 +467,131 @@ bool LoadDds(const std::filesystem::path& path, DdsImage& image_out) {
   if (uint64_t(file_size - data_offset) < total) {
     return false;
   }
-  image.data.resize(size_t(total));
-  file.seekg(data_offset);
-  file.read(reinterpret_cast<char*>(image.data.data()), std::streamsize(total));
-  if (!file) {
-    return false;
-  }
+  image.data.assign(file_data + data_offset, file_data + data_offset + size_t(total));
   image_out = std::move(image);
   return true;
 }
+
+bool LoadDds(const std::filesystem::path& path, DdsImage& image_out) {
+  std::vector<uint8_t> file_data;
+  if (!ReadFile(path, file_data)) {
+    return false;
+  }
+  return ParseDds(file_data.data(), file_data.size(), image_out);
+}
+
+// Keyed replacement files (<hash>.edds): a DDS file encrypted with
+// AES-256-GCM under a key derived from the game's own texture, so a pack can
+// be handed around without being a loose copy of the game's art. The key is
+// SHA-256(kKeyedMagic || untiled base level of the original texture), the
+// same bytes the content hash is taken over; the file name's hash is the
+// authenticated associated data. Layout:
+//   0  magic "F2TXPK01"
+//   8  nonce (12 bytes)
+//   20 tag (16 bytes)
+//   36 ciphertext (the DDS file)
+namespace {
+
+constexpr char kKeyedMagic[8] = {'F', '2', 'T', 'X', 'P', 'K', '0', '1'};
+constexpr size_t kKeyedNonceBytes = 12;
+constexpr size_t kKeyedTagBytes = 16;
+constexpr size_t kKeyedHeaderBytes = sizeof(kKeyedMagic) + kKeyedNonceBytes + kKeyedTagBytes;
+
+bool IsKeyedExtension(const std::filesystem::path& path) {
+  std::string extension = rex::path_to_utf8(path.extension());
+  return extension == ".edds" || extension == ".EDDS";
+}
+
+void DeriveKey(const std::vector<uint8_t>& key_material, uint8_t key_out[32]) {
+  sha256::SHA256 sha;
+  sha.add(kKeyedMagic, sizeof(kKeyedMagic));
+  sha.add(key_material.data(), key_material.size());
+  sha.getHash(key_out);
+}
+
+#if REX_PLATFORM_WIN32
+// AES-256-GCM decrypt-and-verify with CNG. Returns false on a bad tag.
+bool AesGcmDecrypt(const uint8_t key[32], const uint8_t* nonce, const uint8_t* tag,
+                   const uint8_t* aad, size_t aad_size, const uint8_t* cipher,
+                   size_t cipher_size, std::vector<uint8_t>& plain_out) {
+  BCRYPT_ALG_HANDLE alg = nullptr;
+  if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&alg, BCRYPT_AES_ALGORITHM, nullptr, 0))) {
+    return false;
+  }
+  bool ok = false;
+  BCRYPT_KEY_HANDLE key_handle = nullptr;
+  do {
+    if (!BCRYPT_SUCCESS(BCryptSetProperty(alg, BCRYPT_CHAINING_MODE,
+                                          (PUCHAR)BCRYPT_CHAIN_MODE_GCM,
+                                          sizeof(BCRYPT_CHAIN_MODE_GCM), 0))) {
+      break;
+    }
+    if (!BCRYPT_SUCCESS(BCryptGenerateSymmetricKey(alg, &key_handle, nullptr, 0,
+                                                   const_cast<PUCHAR>(key), 32, 0))) {
+      break;
+    }
+    BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO info;
+    BCRYPT_INIT_AUTH_MODE_INFO(info);
+    info.pbNonce = const_cast<PUCHAR>(nonce);
+    info.cbNonce = ULONG(kKeyedNonceBytes);
+    info.pbAuthData = const_cast<PUCHAR>(aad);
+    info.cbAuthData = ULONG(aad_size);
+    info.pbTag = const_cast<PUCHAR>(tag);
+    info.cbTag = ULONG(kKeyedTagBytes);
+    plain_out.resize(cipher_size);
+    ULONG written = 0;
+    NTSTATUS status =
+        BCryptDecrypt(key_handle, const_cast<PUCHAR>(cipher), ULONG(cipher_size), &info, nullptr,
+                      0, plain_out.data(), ULONG(plain_out.size()), &written, 0);
+    ok = BCRYPT_SUCCESS(status) && written == cipher_size;
+  } while (false);
+  if (key_handle) {
+    BCryptDestroyKey(key_handle);
+  }
+  BCryptCloseAlgorithmProvider(alg, 0);
+  if (!ok) {
+    plain_out.clear();
+  }
+  return ok;
+}
+#endif
+
+// Reads and decrypts a keyed replacement. `key_material` is the untiled
+// base level of the texture the file is for. Sets `bad_key` when the file
+// is a keyed container but does not open with this texture's key (the game
+// data differs from the one the pack was made with).
+bool LoadKeyedDds(const std::filesystem::path& path, uint64_t hash,
+                  const std::vector<uint8_t>& key_material, DdsImage& image_out,
+                  bool& bad_key) {
+  bad_key = false;
+  std::vector<uint8_t> file_data;
+  if (!ReadFile(path, file_data) || file_data.size() < kKeyedHeaderBytes ||
+      std::memcmp(file_data.data(), kKeyedMagic, sizeof(kKeyedMagic)) != 0) {
+    return false;
+  }
+#if REX_PLATFORM_WIN32
+  uint8_t key[32];
+  DeriveKey(key_material, key);
+  std::string aad = HashPrefix(hash);
+  std::vector<uint8_t> plain;
+  const uint8_t* nonce = file_data.data() + sizeof(kKeyedMagic);
+  const uint8_t* tag = nonce + kKeyedNonceBytes;
+  const uint8_t* cipher = file_data.data() + kKeyedHeaderBytes;
+  if (!AesGcmDecrypt(key, nonce, tag, reinterpret_cast<const uint8_t*>(aad.data()), aad.size(),
+                     cipher, file_data.size() - kKeyedHeaderBytes, plain)) {
+    bad_key = true;
+    return false;
+  }
+  return ParseDds(plain.data(), plain.size(), image_out);
+#else
+  (void)hash;
+  (void)key_material;
+  (void)image_out;
+  return false;
+#endif
+}
+
+}  // namespace
 
 struct TextureReplacer::DumpJob {
   std::filesystem::path path;
@@ -525,13 +666,16 @@ class TextureReplacer::LoadWorker {
     thread_.join();
   }
 
-  void Request(uint64_t hash, const std::filesystem::path& path) {
+  // `key_material` is the untiled texture for a keyed (.edds) file, empty
+  // for a plain DDS; the key is derived on this thread, off the GPU thread.
+  void Request(uint64_t hash, const std::filesystem::path& path,
+               std::vector<uint8_t>&& key_material) {
     {
       std::lock_guard<std::mutex> lock(mutex_);
       if (!in_flight_.insert(hash).second) {
         return;  // Already queued or being read.
       }
-      queue_.emplace_back(hash, path);
+      queue_.push_back(Job{hash, path, std::move(key_material)});
     }
     cv_.notify_one();
   }
@@ -555,7 +699,7 @@ class TextureReplacer::LoadWorker {
  private:
   void Run() {
     while (true) {
-      std::pair<uint64_t, std::filesystem::path> job;
+      Job job;
       {
         std::unique_lock<std::mutex> lock(mutex_);
         cv_.wait(lock, [this] { return stop_ || !queue_.empty(); });
@@ -566,10 +710,16 @@ class TextureReplacer::LoadWorker {
         queue_.pop_front();
       }
       LoadedImage loaded;
-      loaded.hash = job.first;
-      loaded.path = job.second;
+      loaded.hash = job.hash;
+      loaded.path = job.path;
       auto image = std::make_unique<DdsImage>();
-      if (LoadDds(job.second, *image)) {
+      bool ok;
+      if (IsKeyedExtension(job.path)) {
+        ok = LoadKeyedDds(job.path, job.hash, job.key_material, *image, loaded.bad_key);
+      } else {
+        ok = LoadDds(job.path, *image);
+      }
+      if (ok) {
         loaded.image = std::move(image);
       }
       std::lock_guard<std::mutex> lock(mutex_);
@@ -577,9 +727,15 @@ class TextureReplacer::LoadWorker {
     }
   }
 
+  struct Job {
+    uint64_t hash = 0;
+    std::filesystem::path path;
+    std::vector<uint8_t> key_material;
+  };
+
   std::mutex mutex_;
   std::condition_variable cv_;
-  std::deque<std::pair<uint64_t, std::filesystem::path>> queue_;
+  std::deque<Job> queue_;
   std::vector<LoadedImage> done_;
   std::unordered_set<uint64_t> in_flight_;
   bool stop_ = false;
@@ -608,7 +764,8 @@ void TextureReplacer::Initialize() {
       }
       const std::filesystem::path& path = it->path();
       std::string extension = rex::path_to_utf8(path.extension());
-      if (extension != ".dds" && extension != ".DDS") {
+      if (extension != ".dds" && extension != ".DDS" && extension != ".edds" &&
+          extension != ".EDDS") {
         continue;
       }
       uint64_t hash;
@@ -810,7 +967,14 @@ bool TextureReplacer::RequestLoad(uint64_t hash) {
   if (!load_worker_) {
     load_worker_ = std::make_unique<LoadWorker>();
   }
-  load_worker_->Request(hash, it->second);
+  // A keyed file opens with a key made from the texture itself: hand the
+  // loader the untiled bytes Hash() just produced (this is called right
+  // after it).
+  std::vector<uint8_t> key_material;
+  if (IsKeyedExtension(it->second)) {
+    key_material = last_untiled_;
+  }
+  load_worker_->Request(hash, it->second, std::move(key_material));
   return true;
 }
 

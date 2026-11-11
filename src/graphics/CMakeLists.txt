@@ -28,6 +28,7 @@ set(REXGPU_XENOS_SOURCES
     shared_memory.cpp
     pipeline/texture/cache.cpp
     pipeline/texture/replacement.cpp
+    ${REXGLUE_ROOT}/thirdparty/crypto/sha256.cpp
     pipeline/shader/interpreter.cpp
     pipeline/shader/translator.cpp
     pipeline/shader/translator_disasm.cpp
@@ -161,5 +162,6 @@ if(REXGLUE_USE_D3D12)
         d3d12
         dxgi
         dxguid
+        bcrypt  # keyed texture pack files (AES-GCM)
     )
 endif()

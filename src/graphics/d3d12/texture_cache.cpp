@@ -2433,8 +2433,14 @@ void D3D12TextureCache::ApplyLoadedReplacements() {
   bool any_attached = false;
   for (const auto& loaded : replacement_loaded_) {
     if (!loaded.image && ++warnings <= 64) {
-      REXGPU_WARN("Texture pack: can't read {} (unsupported or broken DDS)",
-                  rex::path_to_utf8(loaded.path));
+      if (loaded.bad_key) {
+        REXGPU_WARN("Texture pack: {} does not open with this game's texture (the pack was "
+                    "made from different game data)",
+                    rex::path_to_utf8(loaded.path));
+      } else {
+        REXGPU_WARN("Texture pack: can't read {} (unsupported or broken DDS)",
+                    rex::path_to_utf8(loaded.path));
+      }
     }
     for (auto it = replacement_pending_.begin(); it != replacement_pending_.end();) {
       D3D12Texture& texture = **it;

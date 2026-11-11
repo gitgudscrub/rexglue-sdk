@@ -302,6 +302,9 @@ class D3D12TextureCache final : public TextureCache {
       Microsoft::WRL::ComPtr<ID3D12Resource> resource;
       DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
       uint32_t mip_count = 0;
+      // Levels the shader resource view exposes: the guest texture's own
+      // count plus one per doubling of size (see the upload code).
+      uint32_t mip_count_shown = 0;
       // Video memory of the resource (not counted in the cache limits, so
       // a big pack doesn't make the cache evict and reload in a loop).
       uint64_t memory_usage = 0;

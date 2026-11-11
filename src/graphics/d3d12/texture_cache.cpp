@@ -2115,7 +2115,7 @@ uint32_t D3D12TextureCache::FindOrCreateTextureDescriptor(D3D12Texture& texture,
     replacement_desc.Format = texture.replacement_.format;
     replacement_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
     replacement_desc.Texture2DArray.MostDetailedMip = 0;
-    replacement_desc.Texture2DArray.MipLevels = texture.replacement_.mip_count;
+    replacement_desc.Texture2DArray.MipLevels = texture.replacement_.mip_count_shown;
     replacement_desc.Texture2DArray.FirstArraySlice = 0;
     replacement_desc.Texture2DArray.ArraySize = 1;
     replacement_desc.Texture2DArray.PlaneSlice = 0;
@@ -2556,6 +2556,19 @@ bool D3D12TextureCache::LoadTextureReplacement(D3D12Texture& texture,
   replacement.resource = std::move(resource);
   replacement.format = desc.Format;
   replacement.mip_count = image.mip_count;
+  // Show no more minification levels than the game's own texture has (plus
+  // one per doubling of the replacement's size). A texture the game shipped
+  // without mips keeps its per-texel look when it is minified, as it does on
+  // the console, instead of the pack's mip chain averaging it smooth: Fable's
+  // rock and sand get their dusty shading from exactly that.
+  {
+    uint32_t guest_mips = texture.key().mip_max_level + 1;
+    uint32_t extra = 0;
+    while ((image.width >> (extra + 1)) >= texture.key().GetWidth() && extra < 8) {
+      ++extra;
+    }
+    replacement.mip_count_shown = std::min(image.mip_count, guest_mips + extra);
+  }
   replacement.memory_usage = device->GetResourceAllocationInfo(0, 1, &desc).SizeInBytes;
   replacement_memory_total_ += replacement.memory_usage;
 

@@ -38,6 +38,9 @@
 #include <rex/ui/d3d12/d3d12_provider.h>
 #include <rex/ui/d3d12/d3d12_util.h>
 
+REXCVAR_DECLARE(int32_t, log_frame_passes);
+namespace rex::graphics::d3d12 { void FlushFramePassRunExternal(); }
+using rex::graphics::d3d12::FlushFramePassRunExternal;
 REXCVAR_DEFINE_INT32(log_resolves, 0, "GPU/D3D12",
                      "Diagnostic: log the next N EDRAM resolves (colour/depth, size, destination)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -1189,8 +1192,10 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
 
   // Diagnostic: log the next N resolves (cvar log_resolves, set from the
   // console), to find which ones carry the scene colour and depth.
-  if (REXCVAR_GET(log_resolves) > 0) {
-    REXCVAR_SET(log_resolves, REXCVAR_GET(log_resolves) - 1);
+  bool log_this_resolve = REXCVAR_GET(log_resolves) > 0 || REXCVAR_GET(log_frame_passes) > 0;
+  if (log_this_resolve) {
+    if (REXCVAR_GET(log_frame_passes) > 0) FlushFramePassRunExternal();
+    if (REXCVAR_GET(log_resolves) > 0) REXCVAR_SET(log_resolves, REXCVAR_GET(log_resolves) - 1);
     REXGPU_INFO(
         "[resolve] {} {}x{} src_base {} dest 0x{:08X} len {} fmt {} clear {}",
         resolve_info.IsCopyingDepth() ? "depth" : "color",
@@ -1249,7 +1254,7 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
           if (width >= 640 && height >= 360 && width != height) {
             for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
               auto* rt = static_cast<D3D12RenderTarget*>(rectangle.render_target);
-              if (REXCVAR_GET(log_resolves) > 0 && rt) {
+              if (log_this_resolve && rt) {
                 REXGPU_INFO("[resolve] depth rt: is_depth {} msaa {} base {} pitch {} (resolve base {})",
                             bool(rt->key().is_depth), uint32_t(rt->key().msaa_samples),
                             uint32_t(rt->key().base_tiles), uint32_t(rt->key().pitch_tiles_at_32bpp),

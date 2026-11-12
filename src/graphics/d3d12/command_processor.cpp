@@ -63,6 +63,11 @@ REXCVAR_DEFINE_INT32(log_frame_shaders, 0, "GPU/D3D12",
                      "Diagnostic: log every vertex/pixel shader pair drawn in the next N frames, "
                      "with draw counts, in first-drawn order")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(log_frame_passes, 0, "GPU/D3D12",
+                     "Diagnostic: log the draws of the next N frames in order, one line per run "
+                     "of draws sharing render targets, viewport and shaders (resolves show via "
+                     "log_resolves, which this also turns on)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(log_frame_textures, 0, "GPU/D3D12",
                      "Diagnostic: log every (pixel shader, fetch constant, texture hash) used in "
                      "the next N frames, with draw counts; texture hashes are the texture pack's "
@@ -81,6 +86,19 @@ struct FrameTextureLog {
   uint32_t draws = 0;
 };
 FrameTextureLog frame_texture_log;
+// log_frame_passes: the current run of draws with identical pass state.
+struct FramePassRun {
+  std::string key;
+  uint32_t first = 0, draws = 0, index = 0;
+};
+FramePassRun frame_pass_run;
+void FlushFramePassRun() {
+  if (frame_pass_run.draws) {
+    REXGPU_INFO("[frame-passes] {:5} x{:<4} {}", frame_pass_run.first, frame_pass_run.draws,
+                frame_pass_run.key);
+  }
+  frame_pass_run.draws = 0;
+}
 
 }  // namespace
 
@@ -181,6 +199,8 @@ REXCVAR_DEFINE_INT32(d3d12_threaded_command_recording_batch_kb, 8, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
+
+void FlushFramePassRunExternal() { FlushFramePassRun(); }
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -2070,6 +2090,12 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  if (REXCVAR_GET(log_frame_passes) > 0) {
+    FlushFramePassRun();
+    REXGPU_INFO("[frame-passes] swap {} ({} draws)", frame_current_, frame_pass_run.index);
+    frame_pass_run = {};
+    REXCVAR_SET(log_frame_passes, REXCVAR_GET(log_frame_passes) - 1);
+  }
   if (REXCVAR_GET(log_frame_shaders) > 0) {
     std::vector<std::pair<uint32_t, std::pair<uint64_t, uint64_t>>> order;
     for (const auto& [key, value] : frame_shader_log.pairs) {
@@ -3125,6 +3151,32 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     auto it = frame_shader_log.pairs.try_emplace(key, frame_shader_log.draws, 0).first;
     ++it->second.second;
     ++frame_shader_log.draws;
+  }
+  if (REXCVAR_GET(log_frame_passes) > 0) {
+    auto surface = regs.Get<reg::RB_SURFACE_INFO>();
+    auto c0 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]);
+    auto c1 = regs.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[1]);
+    auto di = regs.Get<reg::RB_DEPTH_INFO>();
+    auto dc = regs.Get<reg::RB_DEPTHCONTROL>();
+    uint32_t mask = regs[XE_GPU_REG_RB_COLOR_MASK];
+    float vw = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) * 2.0f;
+    float vh = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f;
+    uint32_t blend0 = regs[XE_GPU_REG_RB_BLENDCONTROL0];
+    std::string key = fmt::format(
+        "pitch {:4} msaa {} rt0 {:4}/{:2} rt1 {:4}/{:2} mask {:04X} z {:4}/{} zt{}w{} vp {:4.0f}x{:<4.0f} "
+        "blend {:08X} vs {:016X} ps {:016X}",
+        uint32_t(surface.surface_pitch), uint32_t(surface.msaa_samples), uint32_t(c0.color_base),
+        uint32_t(c0.color_format), uint32_t(c1.color_base), uint32_t(c1.color_format),
+        mask & 0xFFFF, uint32_t(di.depth_base), uint32_t(di.depth_format), uint32_t(dc.z_enable),
+        uint32_t(dc.z_write_enable), vw, vh, blend0, vertex_shader->ucode_data_hash(),
+        pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0));
+    if (key != frame_pass_run.key) {
+      FlushFramePassRun();
+      frame_pass_run.key = std::move(key);
+      frame_pass_run.first = frame_pass_run.index;
+    }
+    ++frame_pass_run.draws;
+    ++frame_pass_run.index;
   }
   bool memexport_used_pixel = pixel_shader && (pixel_shader->memexport_eM_written() != 0);
   bool memexport_used = memexport_used_vertex || memexport_used_pixel;

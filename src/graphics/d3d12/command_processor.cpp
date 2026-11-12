@@ -16,6 +16,7 @@
 #include <sstream>
 #include <map>
 #include <tuple>
+#include <unordered_set>
 #include <utility>
 
 #include <rex/assert.h>
@@ -69,6 +70,11 @@ REXCVAR_DEFINE_INT32(log_frame_passes, 0, "GPU/D3D12",
                      "of draws sharing render targets, viewport and shaders (resolves show via "
                      "log_resolves, which this also turns on)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(log_texture_sets, false, "GPU/D3D12",
+                    "Diagnostic: log each distinct (pixel shader, textures bound to each fetch "
+                    "constant) combination once, as it is first drawn; pairs colour textures "
+                    "with their normal maps across a whole play session")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(log_frame_textures, 0, "GPU/D3D12",
                      "Diagnostic: log every (pixel shader, fetch constant, texture hash) used in "
                      "the next N frames, with draw counts; texture hashes are the texture pack's "
@@ -87,6 +93,8 @@ struct FrameTextureLog {
   uint32_t draws = 0;
 };
 FrameTextureLog frame_texture_log;
+// log_texture_sets: hashes of the (pixel shader, bound textures) sets already logged.
+std::unordered_set<uint64_t> texture_sets_logged;
 // log_frame_passes: the current run of draws with identical pass state.
 struct FramePassRun {
   std::string key;
@@ -3428,6 +3436,22 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       ++it->second.second;
     }
     ++frame_texture_log.draws;
+  }
+  if (REXCVAR_GET(log_texture_sets)) {
+    uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0);
+    uint64_t set_hash = ps_hash * 0x9E3779B97F4A7C15ull;
+    std::string line;
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t fetch_index;
+    while (rex::bit_scan_forward(textures_remaining, &fetch_index)) {
+      textures_remaining &= ~(uint32_t(1) << fetch_index);
+      uint64_t tex_hash = texture_cache_->GetBoundTextureContentHash(fetch_index);
+      set_hash = (set_hash ^ (tex_hash + fetch_index)) * 0x100000001B3ull;
+      line += fmt::format(" {}={:016X}", fetch_index, tex_hash);
+    }
+    if (texture_sets_logged.insert(set_hash).second) {
+      REXGPU_INFO("[texture-set] ps {:016X}{}", ps_hash, line);
+    }
   }
 
   // Bind the pipeline after configuring it and doing everything that may bind

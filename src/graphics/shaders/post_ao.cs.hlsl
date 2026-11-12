@@ -25,7 +25,15 @@ cbuffer PostAoConstants : register(b0) {
   float max_radius_px;  // cap on the projected radius (pixels of depth_size)
   float fade_distance;  // view depth where AO is gone (the game's fog has
                         // taken over by then); near-plane units
-  uint pad1, pad2, pad3, pad4, pad5;
+  // Sun shadows (see SunShadow below).
+  uint sun_enabled;
+  float sun_strength;   // darkening of a shadowed pixel
+  float sun_length;     // march length toward the sun, world units
+  float sun_thickness;  // assumed depth of surfaces, world units
+  uint sun_y_down;     // 1: clip +y is down the screen
+  row_major float4x4 inv_view_proj;  // the game's clip -> world
+  float4 sun_clip;      // clip-space change per world unit toward the sun
+  float4 sun_world;     // world direction toward the sun
 };
 
 // The game's scene depth is multisampled; the MSAA variant (fxc /D MSAA=1)
@@ -56,6 +64,67 @@ float3 ViewPos(int2 p) {
   return float3(c * (z / FocalPx()), z);
 }
 
+// --- sun shadows ------------------------------------------------------------
+// The game's own sun shadow map covers only nearby objects and the ground has
+// only its baked light map, so rocks, roots, trunks and walls cast no sharp
+// shadow on it. With the game's camera matrix (captured from the ground draws)
+// the depth buffer gives exact world positions: march from the pixel toward
+// the sun and look for something in front of the ray.
+float2 NdcOf(float2 p) {
+  float y = p.y / float(depth_size.y) * 2.0 - 1.0;
+  return float2(p.x / float(depth_size.x) * 2.0 - 1.0, sun_y_down != 0 ? y : -y);
+}
+float4 WorldH(float2 ndc, float d) { return mul(inv_view_proj, float4(ndc, d, 1.0)); }
+float3 WorldPos(int2 p) {
+  p = clamp(p, int2(0, 0), int2(depth_size) - 1);
+  float4 h = WorldH(NdcOf(float2(p) + 0.5), LoadDepth(p));
+  return h.xyz / h.w;
+}
+
+float SunShadow(int2 p, float d, float noise) {
+  float2 ndc0 = NdcOf(float2(p) + 0.5);
+  float4 h = WorldH(ndc0, d);
+  float3 pos = h.xyz / h.w;
+  float w0 = 1.0 / h.w;  // the pixel's clip w (its view depth, world units)
+  // Surface normal from the neighbours, turned to face the camera.
+  float3 dx = WorldPos(p + int2(1, 0)) - pos, dx2 = pos - WorldPos(p - int2(1, 0));
+  float3 dy = WorldPos(p + int2(0, 1)) - pos, dy2 = pos - WorldPos(p - int2(0, 1));
+  if (dot(dx2, dx2) < dot(dx, dx)) dx = dx2;
+  if (dot(dy2, dy2) < dot(dy, dy)) dy = dy2;
+  float3 n = normalize(cross(dy, dx));
+  float4 hn = WorldH(ndc0, reversed_z != 0 ? 1.0 : 0.0);  // same pixel on the near plane
+  if (dot(n, hn.xyz / hn.w - pos) < 0.0) n = -n;
+  float ndl = dot(n, sun_world.xyz);
+  if (sun_enabled == 2) return ndl * 0.5 + 0.5;               // debug: facing the sun
+  if (sun_enabled == 3) return frac(pos.x / 4.0) * 0.5 + frac(pos.y / 4.0) * 0.5;  // debug: world grid
+  if (sun_enabled == 4) return frac(pos.z / 4.0);
+  if (ndl < 0.05) return 1.0;  // facing away: the game's lighting has it dark already
+  float4 c0 = float4(ndc0, d, 1.0) * w0;
+  const uint kSteps = 16;
+  float shadow = 0.0;
+  for (uint i = 0; i < kSteps; ++i) {
+    float f = (float(i) + noise) / float(kSteps);
+    float t = sun_length * (0.02 + f * f);  // denser close to the surface
+    float4 c = c0 + sun_clip * t;
+    if (c.w <= 0.0) break;
+    float2 nq = c.xy / c.w;
+    if (any(abs(nq) > 1.0)) break;
+    float qy = sun_y_down != 0 ? nq.y : -nq.y;
+    int2 q = int2((nq.x * 0.5 + 0.5) * float(depth_size.x), (qy * 0.5 + 0.5) * float(depth_size.y));
+    float ds = LoadDepth(clamp(q, int2(0, 0), int2(depth_size) - 1));
+    if (IsSky(ds)) continue;
+    float ws = 1.0 / dot(inv_view_proj[3], float4(nq, ds, 1.0));
+    float gap = c.w - ws;  // > 0: the depth buffer has something in front of the ray
+    if (gap > 0.02 + 0.004 * c.w && gap < sun_thickness) {
+      shadow = 1.0 - f * 0.5;  // far occluders give a lighter, less certain shadow
+      break;
+    }
+  }
+  // Screen-space rays get unreliable far away; the game's fog takes over.
+  shadow *= 1.0 - smoothstep(sun_length * 12.0, sun_length * 25.0, w0);
+  return 1.0 - sun_strength * shadow * saturate(ndl * 4.0);
+}
+
 // --- ao ---------------------------------------------------------------------
 static const uint kSamples = 12;
 
@@ -68,6 +137,8 @@ void ao(uint3 id : SV_DispatchThreadID) {
     ao_out[id.xy] = float2(1.0, 60000.0);  // fits in a half float
     return;
   }
+  float noise = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))));
+  float sun = sun_enabled != 0 ? SunShadow(p, d, noise) : 1.0;
   float3 pos = ViewPos(p);
   // Normal from the smaller of the one-sided differences (keeps edges clean).
   float3 l = pos - ViewPos(p - int2(1, 0)), r = ViewPos(p + int2(1, 0)) - pos;
@@ -79,11 +150,10 @@ void ao(uint3 id : SV_DispatchThreadID) {
 
   float radius_px = min(radius * FocalPx() / pos.z, max_radius_px);
   if (radius_px < 1.0) {
-    ao_out[id.xy] = float2(1.0, pos.z);
+    ao_out[id.xy] = float2(sun, pos.z);
     return;
   }
   // Per-pixel rotation (interleaved gradient noise), removed by the blur.
-  float noise = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))));
   float angle0 = noise * 6.2831853;
   float r2 = radius * radius;
   float sum = 0.0;
@@ -98,7 +168,7 @@ void ao(uint3 id : SV_DispatchThreadID) {
   }
   float occlusion = saturate(1.0 - intensity * radius * sum / float(kSamples));
   occlusion = lerp(occlusion, 1.0, smoothstep(0.25 * fade_distance, fade_distance, pos.z));
-  ao_out[id.xy] = float2(occlusion, pos.z);
+  ao_out[id.xy] = float2(occlusion * sun, pos.z);
 }
 
 // --- blur: 9 taps, weighted by view-depth similarity ------------------------

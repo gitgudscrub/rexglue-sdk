@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstring>
 #include <sstream>
@@ -149,6 +150,26 @@ REXCVAR_DEFINE_BOOL(post_ao_reversed_z, true, "GPU/D3D12",
 REXCVAR_DEFINE_INT32(post_ao_debug, 0, "GPU/D3D12",
                      "AO: 1 shows the occlusion, 2 shows depth bands (checks alignment)")
     .range(0, 2)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_sun_shadows, false, "GPU/D3D12",
+                    "Screen-space sun shadows in the AO pass (needs post_ao): short "
+                    "shadows from rocks, trunks and walls that the game's light maps lack")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(post_sun_debug, 0, "GPU/D3D12",
+                     "Sun shadows debug (with post_ao_debug 1): 1 facing the sun, 2 world x/y grid, 3 world z bands")
+    .range(0, 3)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_strength, 0.5, "GPU/D3D12",
+                      "Sun shadows: how much a shadowed pixel is darkened (0..1)")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_length, 20.0, "GPU/D3D12",
+                      "Sun shadows: how far toward the sun to look, world units")
+    .range(0.1, 200.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_thickness, 6.0, "GPU/D3D12",
+                      "Sun shadows: assumed thickness of what the depth buffer shows, world units")
+    .range(0.01, 100.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
@@ -2846,6 +2867,40 @@ bool D3D12CommandProcessor::EnsurePostGradeTextures(uint32_t width, uint32_t hei
   return true;
 }
 
+namespace {
+// General 4x4 inverse (row-major in and out); false if singular.
+bool InvertMatrix4x4(const float* m, float* out) {
+  double a[4][8];
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) {
+      a[r][c] = m[r * 4 + c];
+      a[r][c + 4] = r == c ? 1.0 : 0.0;
+    }
+  }
+  for (int c = 0; c < 4; ++c) {
+    int pivot = c;
+    for (int r = c + 1; r < 4; ++r) {
+      if (std::abs(a[r][c]) > std::abs(a[pivot][c])) pivot = r;
+    }
+    if (std::abs(a[pivot][c]) < 1e-12) return false;
+    if (pivot != c) {
+      for (int k = 0; k < 8; ++k) std::swap(a[c][k], a[pivot][k]);
+    }
+    double inv_p = 1.0 / a[c][c];
+    for (int k = 0; k < 8; ++k) a[c][k] *= inv_p;
+    for (int r = 0; r < 4; ++r) {
+      if (r == c) continue;
+      double f = a[r][c];
+      for (int k = 0; k < 8; ++k) a[r][k] -= f * a[c][k];
+    }
+  }
+  for (int r = 0; r < 4; ++r) {
+    for (int c = 0; c < 4; ++c) out[r * 4 + c] = float(a[r][c + 4]);
+  }
+  return true;
+}
+}  // namespace
+
 void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
                                               D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
                                               uint32_t width, uint32_t height,
@@ -2935,6 +2990,51 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
   constants.reversed_z = REXCVAR_GET(post_ao_reversed_z) ? 1 : 0;
   constants.max_radius_px = float(REXCVAR_GET(post_ao_max_radius)) * float(height);
   constants.fade_distance = float(REXCVAR_GET(post_ao_fade_distance));
+  constants.sun_enabled = 0;
+  // The game resolves its scene depth before it draws the ground, so the
+  // camera is the one captured in the previous frame.
+  if (REXCVAR_GET(post_sun_shadows) && post_sun_frame_ + 1 >= frame_current_) {
+    const float* m = post_sun_view_proj_;
+    float inv[16];
+    float l[3] = {post_sun_dir_[0], post_sun_dir_[1], post_sun_dir_[2]};
+    bool from_shadow_map = post_sun_shadow_frame_ + 2 >= frame_current_;
+    if (from_shadow_map) {
+      for (uint32_t i = 0; i < 3; ++i) l[i] = post_sun_shadow_dir_[i];
+    }
+    float ll = std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+    float zs = post_sun_zscale_, zo = post_sun_zoffset_;
+    if (ll > 1e-4f && std::abs(zs) > 1e-6f && InvertMatrix4x4(m, inv)) {
+      // The shader feeds the stored depth, which the viewport made
+      // depth = z * zs + zo (Fable II flips it: zs -1, zo 1); fold z =
+      // (depth - zo) / zs into the inverse so it takes the depth directly.
+      for (uint32_t r = 0; r < 4; ++r) {
+        inv[r * 4 + 3] -= inv[r * 4 + 2] * zo / zs;
+        inv[r * 4 + 2] /= zs;
+      }
+      for (float& c : l) c /= ll;
+      constants.sun_enabled = 1 + uint32_t(REXCVAR_GET(post_sun_debug));
+      constants.sun_strength = float(REXCVAR_GET(post_sun_strength));
+      constants.sun_length = float(REXCVAR_GET(post_sun_length));
+      constants.sun_thickness = float(REXCVAR_GET(post_sun_thickness));
+      std::memcpy(constants.inv_view_proj, inv, sizeof(inv));
+      // Clip-space change per world unit toward the sun: M * (l, 0).
+      for (uint32_t r = 0; r < 4; ++r) {
+        constants.sun_clip[r] = m[r * 4 + 0] * l[0] + m[r * 4 + 1] * l[1] + m[r * 4 + 2] * l[2];
+      }
+      constants.sun_world[0] = l[0];
+      constants.sun_world[1] = l[1];
+      constants.sun_world[2] = l[2];
+      constants.sun_y_down = post_sun_yscale_ > 0.0f ? 1 : 0;
+      if (!post_sun_logged_) {
+        post_sun_logged_ = true;
+        REXGPU_INFO(
+            "Sun shadows: viewport y scale {:.1f} z {:.3f} {:.3f}, sun from {}  ({:.3f} {:.3f} {:.3f}), clip rows ({:.3f} {:.3f} {:.3f} {:.3f}) "
+            "({:.3f} {:.3f} {:.3f} {:.3f}) ({:.3f} {:.3f} {:.3f} {:.3f}) ({:.3f} {:.3f} {:.3f} {:.3f})",
+            post_sun_yscale_, zs, zo, from_shadow_map ? "shadow map" : "c80", l[0], l[1], l[2], m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10],
+            m[11], m[12], m[13], m[14], m[15]);
+      }
+    }
+  }
 
   deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());
   deferred_command_list_.D3DSetComputeRoot32BitConstants(
@@ -3143,6 +3243,45 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (!memexport_used_vertex) {
       // This draw has no effect.
       return true;
+    }
+  }
+  if (pixel_shader && REXCVAR_GET(post_sun_shadows) &&
+      pixel_shader->ucode_data_hash() == 0x401A01FD4E5F8757ull) {
+    // A lit shader with the sun shadow map: c36 / c37 take the world
+    // position to shadow map u / v, so the sun lies along their cross product.
+    float a[3], b[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+      a[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 36 * 4 + i);
+      b[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 37 * 4 + i);
+    }
+    float c[3] = {a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]};
+    float cl = std::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    if (cl > 1e-8f) {
+      float sign = c[2] < 0.0f ? -1.0f : 1.0f;  // the sun is above (world z up)
+      for (uint32_t i = 0; i < 3; ++i) post_sun_shadow_dir_[i] = c[i] / cl * sign;
+      post_sun_shadow_frame_ = frame_current_;
+    }
+  }
+  if (pixel_shader && REXCVAR_GET(post_sun_shadows)) {
+    // The game's lightmapped ground shaders: their vertex shader has the
+    // world -> clip matrix in c0..c3 and the pixel shader the direction
+    // toward the sun in c80 (see shaders/grass.ps.hlsl in Fable II).
+    // Only full-size views: the water reflection draws the same ground into a
+    // small target with a mirrored camera.
+    uint64_t h = pixel_shader->ucode_data_hash();
+    float view_h = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f;
+    if ((h == 0x2F8A0341E8C09698ull || h == 0x7DDAD5C29B3F56EEull || h == 0x9C2144E42E95A76Full) &&
+        view_h >= 480.0f) {
+      for (uint32_t i = 0; i < 16; ++i) {
+        post_sun_view_proj_[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i);
+      }
+      for (uint32_t i = 0; i < 4; ++i) {
+        post_sun_dir_[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_256_X + 80 * 4 + i);
+      }
+      post_sun_yscale_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+      post_sun_zscale_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE);
+      post_sun_zoffset_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET);
+      post_sun_frame_ = frame_current_;
     }
   }
   if (REXCVAR_GET(log_frame_shaders) > 0) {

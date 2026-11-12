@@ -628,8 +628,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t ao_mode;
     float bloom_threshold;
     float bloom_strength;
+    uint32_t pad_sun[24];  // same size as PostAoConstants
   };
-  // post_ao.cs.hlsl, same root signature (16 root constants).
+  // post_ao.cs.hlsl, same root signature (40 root constants).
   struct PostAoConstants {
     uint32_t depth_size[2];
     uint32_t ao_size[2];
@@ -640,7 +641,18 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t reversed_z;
     float max_radius_px;
     float fade_distance;
-    uint32_t pad[5];
+    // Screen-space sun shadows (post_sun_shadows): the game's world -> clip
+    // matrix inverted (rows), the clip-space step per world unit toward the
+    // sun, the world direction toward the sun, and the march settings.
+    uint32_t sun_enabled;
+    float sun_strength;
+    float sun_length;     // world units
+    float sun_thickness;  // world units
+    uint32_t sun_y_down;  // 1: clip +y is down the screen (viewport y scale > 0);
+                          // also puts inv_view_proj on a 16-byte boundary
+    float inv_view_proj[16];
+    float sun_clip[4];
+    float sun_world[4];
   };
   static_assert(sizeof(PostAoConstants) == sizeof(PostGradeConstants));
   enum class PostGradeRootParameter : UINT {
@@ -684,6 +696,20 @@ class D3D12CommandProcessor : public CommandProcessor {
   // Frame in which post_ao_textures_[0] was last filled (0 = never).
   uint64_t post_ao_frame_ = 0;
   bool post_ao_logged_ = false;
+  // Camera and sun captured from the ground draws for the sun shadows:
+  // vertex constants c0..c3 (world -> clip rows), pixel constant c80
+  // (direction toward the sun), and the frame they were seen in.
+  float post_sun_view_proj_[16] = {};
+  float post_sun_dir_[4] = {};
+  float post_sun_yscale_ = -1.0f;  // PA_CL_VPORT_YSCALE of the captured draw
+  float post_sun_zscale_ = 1.0f;   // PA_CL_VPORT_ZSCALE / ZOFFSET: depth = z * scale + offset
+  float post_sun_zoffset_ = 0.0f;
+  // Sun direction from the game's shadow-map projection (the direction the
+  // shadow map coordinates don't change along), and the frame it was seen.
+  float post_sun_shadow_dir_[3] = {};
+  uint64_t post_sun_shadow_frame_ = 0;
+  uint64_t post_sun_frame_ = 0;
+  bool post_sun_logged_ = false;
 
   // Vertex buffers seen in draws, by guest address: when one is seen with
   // pages the CPU wrote since its last upload, it is dynamic (a skinned

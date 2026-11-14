@@ -159,6 +159,28 @@ REXCVAR_DEFINE_INT32(post_ao_debug, 0, "GPU/D3D12",
                      "AO: 1 shows the occlusion, 2 shows depth bands (checks alignment)")
     .range(0, 2)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_world_radius, 2.0, "GPU/D3D12",
+                      "AO: radius in world units, using the game's camera (0 = the older "
+                      "near-plane AO). Falls back to the near-plane AO where no camera was "
+                      "seen (rooms without terrain)")
+    .range(0.0, 100.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_world_bias, 0.05, "GPU/D3D12",
+                      "World AO: self-occlusion bias as a fraction of the radius")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_world_intensity, 4.4, "GPU/D3D12",
+                      "World AO: occlusion gain (post_ao_intensity is the near-plane AO's)")
+    .range(0.0, 20.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_world_max_radius, 0.15, "GPU/D3D12",
+                      "World AO: largest screen radius as a fraction of the screen height")
+    .range(0.0, 0.5)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_ao_world_fade, 500.0, "GPU/D3D12",
+                      "World AO: view distance in world units where it has faded out")
+    .range(1.0, 100000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_shadows, false, "GPU/D3D12",
                     "Screen-space sun shadows in the AO pass (needs post_ao): short "
                     "shadows from rocks, trunks and walls that the game's light maps lack")
@@ -3001,7 +3023,8 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
   constants.sun_enabled = 0;
   // The game resolves its scene depth before it draws the ground, so the
   // camera is the one captured in the previous frame.
-  if (REXCVAR_GET(post_sun_shadows) && post_sun_frame_ + 1 >= frame_current_) {
+  bool world_ao = REXCVAR_GET(post_ao_world_radius) > 0.0;
+  if ((REXCVAR_GET(post_sun_shadows) || world_ao) && post_sun_frame_ + 1 >= frame_current_) {
     const float* m = post_sun_view_proj_;
     float inv[16];
     float l[3] = {post_sun_dir_[0], post_sun_dir_[1], post_sun_dir_[2]};
@@ -3020,7 +3043,17 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
         inv[r * 4 + 2] /= zs;
       }
       for (float& c : l) c /= ll;
-      constants.sun_enabled = 1 + uint32_t(REXCVAR_GET(post_sun_debug));
+      if (world_ao) {
+        // World-space AO (post_ao.cs.hlsl WorldAo): the radius rides in
+        // sun_world.w; bias, screen cap and fade switch to world meanings.
+        constants.sun_world[3] = float(REXCVAR_GET(post_ao_world_radius));
+        constants.bias = float(REXCVAR_GET(post_ao_world_bias));
+        constants.intensity = float(REXCVAR_GET(post_ao_world_intensity));
+        constants.max_radius_px = float(REXCVAR_GET(post_ao_world_max_radius)) * float(height);
+        constants.fade_distance = float(REXCVAR_GET(post_ao_world_fade));
+      }
+      constants.sun_enabled =
+          REXCVAR_GET(post_sun_shadows) ? 1 + uint32_t(REXCVAR_GET(post_sun_debug)) : 0;
       constants.sun_strength = float(REXCVAR_GET(post_sun_strength));
       constants.sun_length = float(REXCVAR_GET(post_sun_length));
       constants.sun_thickness = float(REXCVAR_GET(post_sun_thickness));
@@ -3270,7 +3303,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       post_sun_shadow_frame_ = frame_current_;
     }
   }
-  if (pixel_shader && REXCVAR_GET(post_sun_shadows)) {
+  if (pixel_shader && (REXCVAR_GET(post_sun_shadows) || REXCVAR_GET(post_ao_world_radius) > 0.0)) {
     // The game's lightmapped ground shaders: their vertex shader has the
     // world -> clip matrix in c0..c3 and the pixel shader the direction
     // toward the sun in c80 (see shaders/grass.ps.hlsl in Fable II).

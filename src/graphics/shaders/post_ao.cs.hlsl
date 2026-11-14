@@ -33,7 +33,8 @@ cbuffer PostAoConstants : register(b0) {
   uint sun_y_down;     // 1: clip +y is down the screen
   row_major float4x4 inv_view_proj;  // the game's clip -> world
   float4 sun_clip;      // clip-space change per world unit toward the sun
-  float4 sun_world;     // world direction toward the sun
+  float4 sun_world;     // xyz: world direction toward the sun; w: world-space
+                        // AO radius in world units (0 = near-plane AO below)
 };
 
 // The game's scene depth is multisampled; the MSAA variant (fxc /D MSAA=1)
@@ -125,6 +126,54 @@ float SunShadow(int2 p, float d, float noise) {
   return 1.0 - sun_strength * shadow * saturate(ndl * 4.0);
 }
 
+// --- world-space ao -----------------------------------------------------------
+// With the game's camera the radius is in world units, so a rock gets the same
+// contact shading near and far (the near-plane AO can only reach a few pixels
+// and puts dark halos round foreground edges). Samples on a screen spiral
+// sized to the radius at the pixel's depth; each one occludes by how far it
+// rises above the surface, falling off to zero at the radius, so things more
+// than a radius away (a wall far behind a rock) add nothing.
+static const uint kWorldSamples = 16;
+
+float WorldAo(int2 p, float d, float noise, float radius_w) {
+  float2 ndc0 = NdcOf(float2(p) + 0.5);
+  float4 h = WorldH(ndc0, d);
+  float3 pos = h.xyz / h.w;
+  float w0 = 1.0 / h.w;
+  // World size of one pixel at this depth (across the view, not the surface).
+  float4 h1 = WorldH(NdcOf(float2(p) + float2(1.5, 0.5)), d);
+  float px_w = length(h1.xyz / h1.w - pos);
+  float radius_px = min(radius_w / max(px_w, 1e-6), max_radius_px);
+  if (radius_px < 1.5) return 1.0;
+  float3 dx = WorldPos(p + int2(1, 0)) - pos, dx2 = pos - WorldPos(p - int2(1, 0));
+  float3 dy = WorldPos(p + int2(0, 1)) - pos, dy2 = pos - WorldPos(p - int2(0, 1));
+  if (dot(dx2, dx2) < dot(dx, dx)) dx = dx2;
+  if (dot(dy2, dy2) < dot(dy, dy)) dy = dy2;
+  float3 n = normalize(cross(dy, dx));
+  float4 hn = WorldH(ndc0, reversed_z != 0 ? 1.0 : 0.0);
+  if (dot(n, hn.xyz / hn.w - pos) < 0.0) n = -n;
+  float r2 = radius_w * radius_w;
+  float b = bias * radius_w;
+  float sum = 0.0;
+  float angle0 = noise * 6.2831853;
+  for (uint i = 0; i < kWorldSamples; ++i) {
+    float t = (float(i) + 0.5) / float(kWorldSamples);
+    float a = angle0 + float(i) * 2.3999632;
+    float2 offset = float2(cos(a), sin(a)) * (radius_px * sqrt(t));
+    int2 q = clamp(p + int2(round(offset)), int2(0, 0), int2(depth_size) - 1);
+    float dq = LoadDepth(q);
+    if (IsSky(dq)) continue;
+    float3 v = WorldPos(q) - pos;
+    float vv = dot(v, v);
+    float falloff = saturate(1.0 - vv / r2);
+    // cos of the elevation above the surface plane, less a small bias
+    sum += saturate((dot(v, n) - b) * rsqrt(vv + 1e-6)) * falloff * falloff;
+  }
+  float occ = saturate(1.0 - intensity * 2.0 * sum / float(kWorldSamples));
+  // Far away the radius is a few pixels and the game's fog takes over.
+  return lerp(occ, 1.0, smoothstep(fade_distance * 0.5, fade_distance, w0));
+}
+
 // --- ao ---------------------------------------------------------------------
 static const uint kSamples = 12;
 
@@ -139,6 +188,10 @@ void ao(uint3 id : SV_DispatchThreadID) {
   }
   float noise = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))));
   float sun = sun_enabled != 0 ? SunShadow(p, d, noise) : 1.0;
+  if (sun_world.w > 0.0) {
+    ao_out[id.xy] = float2(WorldAo(p, d, noise, sun_world.w) * sun, ViewPos(p).z);
+    return;
+  }
   float3 pos = ViewPos(p);
   // Normal from the smaller of the one-sided differences (keeps edges clean).
   float3 l = pos - ViewPos(p - int2(1, 0)), r = ViewPos(p + int2(1, 0)) - pos;

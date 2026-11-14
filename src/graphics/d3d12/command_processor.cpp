@@ -207,6 +207,10 @@ REXCVAR_DEFINE_INT32(post_sun_map_interval, 2, "GPU/D3D12",
                      "in between the last one is reused, which roughly halves its cost at 2")
     .range(1, 8)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(log_sun_map, 0, "GPU/D3D12",
+                     "Diagnostic: log every depth-only draw before the scene depth resolve "
+                     "(one frame in every 600 while on)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map_flip, false, "GPU/D3D12",
                     "Sun shadow map: mirror the map's up axis (swaps which triangle faces "
                     "the game's culling keeps when drawing from the sun)")
@@ -3126,7 +3130,9 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
         constants.sun_map2[0] = sun_map_depth_;
         constants.sun_map2[1] = float(sun_map_size_);
         constants.sun_map2[2] = float(REXCVAR_GET(post_sun_map_bias));
-        constants.sun_map2[3] = REXCVAR_GET(post_sun_debug) ? 2.0f : 1.0f;
+        constants.sun_map2[3] = REXCVAR_GET(post_sun_debug) >= 2  ? 3.0f
+                                : REXCVAR_GET(post_sun_debug) == 1 ? 2.0f
+                                                                   : 1.0f;
         if (!sun_map_logged_) {
           sun_map_logged_ = true;
           REXGPU_INFO(
@@ -3356,11 +3362,12 @@ bool D3D12CommandProcessor::SetupSunMapFrame() {
   return true;
 }
 
-void D3D12CommandProcessor::ReplayDrawIntoSunMap(const D3D12Shader* vertex_shader,
+bool D3D12CommandProcessor::ReplayDrawIntoSunMap(const D3D12Shader* vertex_shader,
                                                  const D3D12Shader* pixel_shader,
                                                  ID3D12RootSignature* root_signature,
                                                  const draw_util::ViewportInfo& viewport_info,
-                                                 bool indexed, uint32_t vertex_count) {
+                                                 bool indexed, uint32_t vertex_count,
+                                                 D3D12_CPU_DESCRIPTOR_HANDLE dsv) {
   // The translated vertex shader ends with pos.xyz = pos.xyz * ndc_scale +
   // ndc_offset * pos.w; undo that so the redrawn position comes out exactly
   // in sun clip space: c0..c3 (the guest's clip = c_i . position) become
@@ -3368,7 +3375,7 @@ void D3D12CommandProcessor::ReplayDrawIntoSunMap(const D3D12Shader* vertex_shade
   float ninv[16] = {};
   for (uint32_t i = 0; i < 3; ++i) {
     float s = viewport_info.ndc_scale[i];
-    if (std::abs(s) < 1e-12f) return;
+    if (std::abs(s) < 1e-12f) return false;
     ninv[i * 4 + i] = 1.0f / s;
     ninv[i * 4 + 3] = -viewport_info.ndc_offset[i] / s;
   }
@@ -3396,7 +3403,6 @@ void D3D12CommandProcessor::ReplayDrawIntoSunMap(const D3D12Shader* vertex_shade
     }
   }
   cbuffer_binding_float_vertex_.up_to_date = false;
-  D3D12_CPU_DESCRIPTOR_HANDLE dsv = sun_map_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
   deferred_command_list_.D3DOMSetRenderTargets(0, nullptr, FALSE, &dsv);
   render_target_cache_->InvalidateCommandListRenderTargets();
   D3D12_VIEWPORT viewport = {0.0f, 0.0f, float(sun_map_size_), float(sun_map_size_), 0.0f, 1.0f};
@@ -3411,10 +3417,10 @@ void D3D12CommandProcessor::ReplayDrawIntoSunMap(const D3D12Shader* vertex_shade
     } else {
       deferred_command_list_.D3DDrawInstanced(vertex_count, 1, 0, 0);
     }
-    ++sun_map_draws_;
   }
   for (uint32_t i = 0; i < 16; ++i) regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i] = saved[i];
   cbuffer_binding_float_vertex_.up_to_date = false;
+  return bound;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -3652,11 +3658,15 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     uint32_t blend0 = regs[XE_GPU_REG_RB_BLENDCONTROL0];
     std::string key = fmt::format(
         "pitch {:4} msaa {} rt0 {:4}/{:2} rt1 {:4}/{:2} mask {:04X} z {:4}/{} zt{}w{} vp {:4.0f}x{:<4.0f} "
-        "blend {:08X} vs {:016X} ps {:016X}",
+        "blend {:08X} at{} cull{} vs {:016X} ps {:016X}",
         uint32_t(surface.surface_pitch), uint32_t(surface.msaa_samples), uint32_t(c0.color_base),
         uint32_t(c0.color_format), uint32_t(c1.color_base), uint32_t(c1.color_format),
         mask & 0xFFFF, uint32_t(di.depth_base), uint32_t(di.depth_format), uint32_t(dc.z_enable),
-        uint32_t(dc.z_write_enable), vw, vh, blend0, vertex_shader->ucode_data_hash(),
+        uint32_t(dc.z_write_enable), vw, vh, blend0,
+        uint32_t(regs.Get<reg::RB_COLORCONTROL>().alpha_test_enable),
+        uint32_t(regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_front) |
+            (uint32_t(regs.Get<reg::PA_SU_SC_MODE_CNTL>().cull_back) << 1),
+        vertex_shader->ucode_data_hash(),
         pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0));
     if (key != frame_pass_run.key) {
       FlushFramePassRun();
@@ -4081,6 +4091,20 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     }
   }
   // Sun shadow map: draw the depth pre-pass a second time from the sun.
+  if (REXCVAR_GET(log_sun_map) > 0 && frame_current_ % 600 == 0 &&
+      (normalized_color_mask == 0 || dynamic_mesh) &&
+      (sun_map_scene_depth_frame_ != frame_current_ || dynamic_mesh)) {
+    REXGPU_INFO("[sun-map] vs {:016X} ps {:016X} rt{} mx{} tess{} z{}{} func{} dyn{} vp {:.0f}x{:.0f}",
+                vertex_shader->ucode_data_hash(),
+                pixel_shader ? pixel_shader->ucode_data_hash() : 0ull,
+                uint32_t(host_render_targets_used), uint32_t(memexport_used),
+                uint32_t(primitive_processing_result.IsTessellated()),
+                uint32_t(normalized_depth_control.z_enable),
+                uint32_t(normalized_depth_control.z_write_enable),
+                uint32_t(normalized_depth_control.zfunc), uint32_t(dynamic_mesh),
+                std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) * 2.0f,
+                std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f);
+  }
   if (REXCVAR_GET(post_sun_map) && REXCVAR_GET(post_sun_shadows) && REXCVAR_GET(post_ao) &&
       REXCVAR_GET(post_grade) && host_render_targets_used && !memexport_used &&
       !primitive_processing_result.IsTessellated() && normalized_color_mask == 0 &&
@@ -4116,11 +4140,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       skipped |= sun_map_frame_ != UINT64_MAX && sun_map_frame_ != frame_current_ &&
                  frame_current_ < sun_map_frame_ + interval;
       if (!skipped && SetupSunMapFrame()) {
-        ReplayDrawIntoSunMap(
-            vertex_shader, pixel_shader, root_signature, viewport_info,
-            primitive_processing_result.index_buffer_type !=
-                PrimitiveProcessor::ProcessedIndexBufferType::kNone,
-            primitive_processing_result.host_draw_vertex_count);
+        if (ReplayDrawIntoSunMap(
+                vertex_shader, pixel_shader, root_signature, viewport_info,
+                primitive_processing_result.index_buffer_type !=
+                    PrimitiveProcessor::ProcessedIndexBufferType::kNone,
+                primitive_processing_result.host_draw_vertex_count,
+                sun_map_dsv_heap_->GetCPUDescriptorHandleForHeapStart())) {
+          ++sun_map_draws_;
+        }
       }
     }
   }

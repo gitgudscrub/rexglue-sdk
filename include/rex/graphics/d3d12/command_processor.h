@@ -721,10 +721,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   // count as the scene depth, so the guest pipeline is reused unchanged), and
   // the AO pass looks the scene up in it. See ReplayDrawIntoSunMap.
   bool SetupSunMapFrame();
-  void ReplayDrawIntoSunMap(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+  bool ReplayDrawIntoSunMap(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                             ID3D12RootSignature* root_signature,
                             const draw_util::ViewportInfo& viewport_info,
-                            bool indexed, uint32_t vertex_count);
+                            bool indexed, uint32_t vertex_count,
+                            D3D12_CPU_DESCRIPTOR_HANDLE dsv);
+
   Microsoft::WRL::ComPtr<ID3D12Resource> sun_map_;
   Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> sun_map_dsv_heap_;
   uint32_t sun_map_size_ = 0;

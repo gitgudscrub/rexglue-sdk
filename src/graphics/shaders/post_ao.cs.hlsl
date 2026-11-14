@@ -161,7 +161,13 @@ float SunMapShadow(int2 p, float d) {
   float depth_half = sun_map2.x;
   float size = sun_map2.y;
   float bias_texels = sun_map2.z;
-  bool debug = sun_map2.w > 1.5;
+  // Mode 1 on, 2 coverage, 3 the map itself.
+  float mode = sun_map2.w;
+  bool debug = mode > 1.5;
+  if (mode > 2.5) {  // debug: the map itself stretched over the screen
+    float m = LoadSunMap(int2(float2(p) / float2(depth_size) * size));
+    return m <= 0.0 ? 0.0 : frac(m * 50.0) * 0.8 + 0.2;
+  }
   float texel = 2.0 * radius / size;
   // Normal offset: step off the surface so it does not shadow itself.
   float3 v = pos + n * (texel * bias_texels) - sun_map.xyz;

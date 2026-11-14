@@ -156,6 +156,11 @@ REXCVAR_DEFINE_DOUBLE(post_light_shafts_decay, 0.96, "GPU/D3D12",
                       "Light shafts: weight kept per sample along a ray")
     .range(0.5, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_light_shafts_shadows, 0.25, "GPU/D3D12",
+                      "Light shafts: share of the glow on dark pixels (1 = even veil, lower "
+                      "keeps shadows deep)")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(post_light_shafts_threshold, 0.45, "GPU/D3D12",
                       "Light shafts: sky brightness where they start")
     .range(0.0, 0.99)
@@ -2777,6 +2782,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               constants.shafts_params[0] = float(REXCVAR_GET(post_light_shafts_length));
               constants.shafts_params[1] = float(REXCVAR_GET(post_light_shafts_decay));
               constants.shafts_params[2] = float(REXCVAR_GET(post_light_shafts_threshold));
+              constants.shafts_params[3] = float(REXCVAR_GET(post_light_shafts_shadows));
             }
 
             deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());

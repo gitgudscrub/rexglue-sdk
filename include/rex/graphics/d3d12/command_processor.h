@@ -629,7 +629,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     float bloom_threshold;
     float bloom_strength;
     // Light shafts: sun UV, strength (0 = off), source radius; ray length,
-    // decay, sky threshold, unused (post_grade.cs.hlsl).
+    // decay, sky threshold, glow on dark pixels (post_grade.cs.hlsl).
     float shafts_sun[4];
     float shafts_params[4];
     // Distance dehaze: amount, start and full depth, debug.

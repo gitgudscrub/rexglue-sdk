@@ -51,7 +51,7 @@ cbuffer PostGradeConstants : register(b0) {
   // Light shafts: sun position in frame UV (may lie off screen), strength
   // (0 = off), radius of the sky around the sun that feeds them (in frame
   // heights); ray length (fraction of the way to the sun), per-sample decay,
-  // sky brightness threshold, unused.
+  // sky brightness threshold, glow kept on dark pixels.
   float4 shafts_sun;
   float4 shafts_params;
   // Distance dehaze: amount of the fog removed at full distance (0 = off),
@@ -382,6 +382,9 @@ void grade(uint3 id : SV_DispatchThreadID) {
   }
   if (shafts_sun.z > 0.0) {
     float3 b = saturate(bloom_tex.SampleLevel(linear_clamp, uv, 0.0).rgb * shafts_sun.z);
+    // Keep shadowed surfaces dark: the glow fades to shafts_params.w of its
+    // strength on dark pixels, so the beams don't veil the whole frame.
+    b *= lerp(shafts_params.w, 1.0, smoothstep(0.05, 0.6, Luma(saturate(c))));
     c = 1.0 - (1.0 - saturate(c)) * (1.0 - b);
   }
   float3 g = saturate(Grade(saturate(c), blurred) * ExposureScale(mean_luma));

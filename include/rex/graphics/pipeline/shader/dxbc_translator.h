@@ -51,6 +51,12 @@ class DxbcShaderTranslator : public ShaderTranslator {
                        bool edram_rov_used, bool gamma_render_target_as_unorm8 = false,
                        bool msaa_2x_supported = true, uint32_t draw_resolution_scale_x = 1,
                        uint32_t draw_resolution_scale_y = 1, bool force_emit_source_map = false);
+
+  // Larger of the two resolution-scale factors this translator bakes in.
+  uint32_t draw_resolution_scale_max() const {
+    return draw_resolution_scale_x_ > draw_resolution_scale_y_ ? draw_resolution_scale_x_
+                                                               : draw_resolution_scale_y_;
+  }
   ~DxbcShaderTranslator() override;
 
   // Stage linkage ordering and rules (must be respected not only within the

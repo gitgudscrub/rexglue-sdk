@@ -1115,7 +1115,8 @@ bool PipelineCache::ConfigurePipeline(
 }
 
 // shader_highlight / shader_replace_dir (see the cvars).
-void PipelineCache::ApplyShaderOverrides(D3D12Shader::D3D12Translation& translation) {
+void PipelineCache::ApplyShaderOverrides(D3D12Shader::D3D12Translation& translation,
+                                         uint32_t resolution_scale) {
   const Shader& shader = translation.shader();
   char hash_text[17];
   std::snprintf(hash_text, sizeof(hash_text), "%016llX",
@@ -1129,8 +1130,16 @@ void PipelineCache::ApplyShaderOverrides(D3D12Shader::D3D12Translation& translat
                 : std::filesystem::is_directory(replace_dir, ec) ? "found" : "NOT FOUND");
   }
   if (!replace_dir.empty()) {
-    std::filesystem::path path = std::filesystem::path(replace_dir) / (std::string(hash_text) + ".dxbc");
+    // Shaders that read the pixel position bake the resolution scale in, so
+    // prefer a variant built for the current one (<hash>.x<scale>.dxbc).
+    uint32_t scale = resolution_scale;
+    std::filesystem::path dir(replace_dir);
+    std::filesystem::path path =
+        dir / (std::string(hash_text) + ".x" + std::to_string(scale) + ".dxbc");
     std::error_code ec;
+    if (!std::filesystem::is_regular_file(path, ec)) {
+      path = dir / (std::string(hash_text) + ".dxbc");
+    }
     if (std::filesystem::is_regular_file(path, ec)) {
       std::ifstream file(path, std::ios::binary);
       std::vector<uint8_t> binary((std::istreambuf_iterator<char>(file)),
@@ -1183,7 +1192,7 @@ bool PipelineCache::TranslateAnalyzedShader(DxbcShaderTranslator& translator,
     REXGPU_ERROR("Shader {:016X} translation failed; marking as ignored", shader.ucode_data_hash());
     return false;
   }
-  ApplyShaderOverrides(translation);
+  ApplyShaderOverrides(translation, translator.draw_resolution_scale_max());
 
   const char* host_shader_type;
   if (shader.type() == xenos::ShaderType::kVertex) {

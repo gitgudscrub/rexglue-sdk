@@ -273,7 +273,9 @@ class PipelineCache {
                           uint32_t dword_count, uint64_t data_hash);
 
   // shader_highlight / shader_replace_dir, right after translation.
-  static void ApplyShaderOverrides(D3D12Shader::D3D12Translation& translation);
+  // resolution_scale picks <hash>.x<scale>.dxbc over <hash>.dxbc when present.
+  static void ApplyShaderOverrides(D3D12Shader::D3D12Translation& translation,
+                                   uint32_t resolution_scale);
 
   // Can be called from multiple threads.
   bool TranslateAnalyzedShader(DxbcShaderTranslator& translator,

@@ -628,9 +628,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t ao_mode;
     float bloom_threshold;
     float bloom_strength;
-    uint32_t pad_sun[32];  // same size as PostAoConstants
+    uint32_t pad_sun[36];  // same size as PostAoConstants
   };
-  // post_ao.cs.hlsl, same root signature (48 root constants).
+  // post_ao.cs.hlsl, same root signature (52 root constants).
   struct PostAoConstants {
     uint32_t depth_size[2];
     uint32_t ao_size[2];
@@ -658,6 +658,10 @@ class D3D12CommandProcessor : public CommandProcessor {
     // 2 debug coverage).
     float sun_map[4];
     float sun_map2[4];
+    // Surfaces facing away from the sun (leaf undersides seen from below):
+    // offset toward the sun in world units (0 = treat them as lit), and how
+    // much of the shadow they take (0..1).
+    float sun_map3[4];
   };
   static_assert(sizeof(PostAoConstants) == sizeof(PostGradeConstants));
   enum class PostGradeRootParameter : UINT {

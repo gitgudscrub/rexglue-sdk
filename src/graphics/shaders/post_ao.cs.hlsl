@@ -40,6 +40,9 @@ cbuffer PostAoConstants : register(b0) {
   // (0 off, 1 on, 2 debug coverage).
   float4 sun_map;
   float4 sun_map2;
+  // Surfaces facing away from the sun: x offset toward the sun (world units,
+  // 0 = count them as lit), y how much shadow they take.
+  float4 sun_map3;
 };
 
 // The game's scene depth is multisampled; the MSAA variant (fxc /D MSAA=1)
@@ -169,15 +172,21 @@ float SunMapShadow(int2 p, float d) {
     return m <= 0.0 ? 0.0 : frac(m * 50.0) * 0.8 + 0.2;
   }
   float texel = 2.0 * radius / size;
+  // Facing away from the sun. Opaque back faces are dark from the game's own
+  // lighting already, but leaves (lit through by the sun) and depth normals
+  // on leaf cards seen from below land here too: test them from a point
+  // moved toward the sun by sun_map3.x, so only something well above (the
+  // canopy over them) shades them, not the surface they belong to.
+  bool back = ndl < 0.05 && !debug;
+  if (back && sun_map3.x <= 0.0) return 1.0;
   // Normal offset: step off the surface so it does not shadow itself.
-  float3 v = pos + n * (texel * bias_texels) - sun_map.xyz;
+  float3 v = (back ? pos + l * sun_map3.x : pos + n * (texel * bias_texels)) - sun_map.xyz;
   float x = dot(right, v) / radius, y = dot(up, v) / radius;
   float z = dot(l, v) / (2.0 * depth_half) + 0.5;
   float edge = max(abs(x), abs(y));
   if (edge >= 1.0 || z >= 1.0 || z <= 0.0) {
     return debug ? 0.5 : -1.0;  // debug: grey outside the map
   }
-  if (ndl < 0.05 && !debug) return 1.0;
   float2 uv = float2(x * 0.5 + 0.5, 0.5 - y * 0.5) * size - 0.5;
   float z_bias = texel * bias_texels / (2.0 * depth_half);
   int2 base = int2(floor(uv));
@@ -200,7 +209,7 @@ float SunMapShadow(int2 p, float d) {
   }
   float shadow = 1.0 - sum / 9.0;
   if (debug) return 1.0 - shadow * 0.8;  // bright = lit, dark = shadowed
-  float result = 1.0 - sun_strength * shadow * saturate(ndl * 4.0);
+  float result = 1.0 - sun_strength * shadow * (back ? sun_map3.y : saturate(ndl * 4.0));
   // Blend into the screen-space march near the map's edge.
   float blend = smoothstep(0.85, 1.0, edge);
   if (blend > 0.0) {

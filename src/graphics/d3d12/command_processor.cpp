@@ -202,6 +202,15 @@ REXCVAR_DEFINE_DOUBLE(post_sun_map_bias, 1.5, "GPU/D3D12",
                       "Sun shadow map: bias in texels (normal offset and depth)")
     .range(0.0, 20.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_map_back, 3.0, "GPU/D3D12",
+                      "Sun shadow map: surfaces facing away from the sun (leaf undersides) are "
+                      "tested from this far toward the sun, world units (0 = count them as lit)")
+    .range(0.0, 50.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_map_back_strength, 1.0, "GPU/D3D12",
+                      "Sun shadow map: how much shadow surfaces facing away from the sun take")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(post_sun_map_interval, 2, "GPU/D3D12",
                      "Sun shadow map: redraw it every this many frames (1 = every frame); "
                      "in between the last one is reused, which roughly halves its cost at 2")
@@ -3130,6 +3139,8 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
         constants.sun_map2[0] = sun_map_depth_;
         constants.sun_map2[1] = float(sun_map_size_);
         constants.sun_map2[2] = float(REXCVAR_GET(post_sun_map_bias));
+        constants.sun_map3[0] = float(REXCVAR_GET(post_sun_map_back));
+        constants.sun_map3[1] = float(REXCVAR_GET(post_sun_map_back_strength));
         constants.sun_map2[3] = REXCVAR_GET(post_sun_debug) >= 2  ? 3.0f
                                 : REXCVAR_GET(post_sun_debug) == 1 ? 2.0f
                                                                    : 1.0f;

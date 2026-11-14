@@ -181,6 +181,40 @@ REXCVAR_DEFINE_DOUBLE(post_ao_world_fade, 500.0, "GPU/D3D12",
                       "World AO: view distance in world units where it has faded out")
     .range(1.0, 100000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
+                    "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "
+                    "depth pre-pass is drawn a second time from the sun, so rocks, walls, "
+                    "trees and characters cast sharp shadows whether or not they are on screen")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(post_sun_map_size, 2048, "GPU/D3D12",
+                     "Sun shadow map: width and height in texels (applies on the next frame)")
+    .range(256, 8192)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_map_radius, 120.0, "GPU/D3D12",
+                      "Sun shadow map: half the width of the area it covers, world units")
+    .range(1.0, 2000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_map_depth, 400.0, "GPU/D3D12",
+                      "Sun shadow map: half the depth range along the sun, world units")
+    .range(1.0, 20000.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_sun_map_bias, 1.5, "GPU/D3D12",
+                      "Sun shadow map: bias in texels (normal offset and depth)")
+    .range(0.0, 20.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(post_sun_map_interval, 2, "GPU/D3D12",
+                     "Sun shadow map: redraw it every this many frames (1 = every frame); "
+                     "in between the last one is reused, which roughly halves its cost at 2")
+    .range(1, 8)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_sun_map_flip, false, "GPU/D3D12",
+                    "Sun shadow map: mirror the map's up axis (swaps which triangle faces "
+                    "the game's culling keeps when drawing from the sun)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(post_sun_map_skip_vs, "129F7F2793DA9084", "GPU/D3D12",
+                      "Sun shadow map: vertex shader hashes (comma separated) whose position does "
+                      "not come from c0..c3, so they are not redrawn from the sun")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_shadows, false, "GPU/D3D12",
                     "Screen-space sun shadows in the AO pass (needs post_ao): short "
                     "shadows from rocks, trunks and walls that the game's light maps lack")
@@ -2980,10 +3014,32 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
                 multisampled ? " (MSAA)" : "", ao_width, ao_height);
   }
 
-  // d0 depth SRV, d1 ao0 UAV, d2 ao0 SRV, d3 ao1 UAV, d4 ao1 SRV, d5 ao0 UAV.
-  ui::d3d12::util::DescriptorCpuGpuHandlePair d[6];
-  if (!RequestOneUseSingleViewDescriptors(6, d)) {
+  // d0 depth SRV, d1 ao0 UAV, d2 ao0 SRV, d3 ao1 UAV, d4 ao1 SRV, d5 ao0 UAV,
+  // d6 sun shadow map SRV (when drawn this frame).
+  sun_map_scene_depth_frame_ = frame_current_;
+  bool sun_map = REXCVAR_GET(post_sun_map) && REXCVAR_GET(post_sun_shadows) && sun_map_ &&
+                 sun_map_frame_ != UINT64_MAX &&
+                 frame_current_ < sun_map_frame_ +
+                                      uint64_t(std::max(1, REXCVAR_GET(post_sun_map_interval))) &&
+                 sun_map_draws_ > 0;
+  ui::d3d12::util::DescriptorCpuGpuHandlePair d[7];
+  if (!RequestOneUseSingleViewDescriptors(sun_map ? 7 : 6, d)) {
     return;
+  }
+  if (sun_map) {
+    D3D12_SHADER_RESOURCE_VIEW_DESC desc = {};
+    desc.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    if (sun_map_samples_ > 1) {
+      desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+    } else {
+      desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      desc.Texture2D.MipLevels = 1;
+    }
+    device->CreateShaderResourceView(sun_map_.Get(), &desc, d[6].first);
+    PushTransitionBarrier(sun_map_.Get(), D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    sun_map_srv_state_ = true;
   }
   device->CopyDescriptorsSimple(1, d[0].first, depth_srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
   ID3D12Resource* ao0 = post_ao_textures_[0].Get();
@@ -3058,6 +3114,29 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
       constants.sun_length = float(REXCVAR_GET(post_sun_length));
       constants.sun_thickness = float(REXCVAR_GET(post_sun_thickness));
       std::memcpy(constants.inv_view_proj, inv, sizeof(inv));
+      if (sun_map) {
+        // Shadow map (post_ao.cs.hlsl SunMapShadow); the screen-space march
+        // still shades what lies outside it. The sun direction is the one the
+        // map was drawn along (same frame, same source).
+        for (uint32_t i = 0; i < 3; ++i) {
+          constants.sun_map[i] = sun_map_center_[i];
+          l[i] = sun_map_dir_[i];
+        }
+        constants.sun_map[3] = sun_map_radius_;
+        constants.sun_map2[0] = sun_map_depth_;
+        constants.sun_map2[1] = float(sun_map_size_);
+        constants.sun_map2[2] = float(REXCVAR_GET(post_sun_map_bias));
+        constants.sun_map2[3] = REXCVAR_GET(post_sun_debug) ? 2.0f : 1.0f;
+        if (!sun_map_logged_) {
+          sun_map_logged_ = true;
+          REXGPU_INFO(
+              "Sun shadow map: {}x{} ({} samples), {} draws, radius {:.1f}, depth {:.1f}, "
+              "centre ({:.1f} {:.1f} {:.1f}), sun ({:.3f} {:.3f} {:.3f})",
+              sun_map_size_, sun_map_size_, sun_map_samples_, sun_map_draws_, sun_map_radius_,
+              sun_map_depth_, sun_map_center_[0], sun_map_center_[1], sun_map_center_[2], l[0],
+              l[1], l[2]);
+        }
+      }
       // Clip-space change per world unit toward the sun: M * (l, 0).
       for (uint32_t r = 0; r < 4; ++r) {
         constants.sun_clip[r] = m[r * 4 + 0] * l[0] + m[r * 4 + 1] * l[1] + m[r * 4 + 2] * l[2];
@@ -3098,6 +3177,8 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
   // The root signature is shared with the grade: post_ao.cs.hlsl reads the
   // depth from t0 (kSource) and the occlusion from t1 (kLuma).
   table(PostGradeRootParameter::kSource, d[0]);
+  // t2 (kMean, unused by the occlusion otherwise) carries the sun shadow map.
+  table(PostGradeRootParameter::kMean, sun_map ? d[6] : d[0]);
   table(PostGradeRootParameter::kDestination, d[1]);
   pass(multisampled ? post_ao_ms_pipeline_.Get() : post_ao_pipeline_.Get(), ao0);
   table(PostGradeRootParameter::kLuma, d[2]);
@@ -3107,6 +3188,233 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
   table(PostGradeRootParameter::kDestination, d[5]);
   pass(post_ao_blur_v_pipeline_.Get(), ao0);
   post_ao_frame_ = frame_current_;
+  if (sun_map) {
+    PushTransitionBarrier(sun_map_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    sun_map_srv_state_ = false;
+  }
+}
+
+// Sun shadow map: once a frame, at the first depth pre-pass draw, place a
+// square orthographic view along the sun around the camera and clear the map.
+bool D3D12CommandProcessor::SetupSunMapFrame() {
+  if (sun_map_setup_frame_ == frame_current_) {
+    return sun_map_setup_ok_;
+  }
+  sun_map_setup_frame_ = frame_current_;
+  sun_map_setup_ok_ = false;
+  if (post_sun_frame_ + 1 < frame_current_) {
+    return false;
+  }
+  ID3D12Resource* depth = render_target_cache_->GetCurrentDepthResource();
+  if (!depth) {
+    return false;
+  }
+  D3D12_RESOURCE_DESC depth_desc = depth->GetDesc();
+  // Only the scene's 32-bit float depth with stencil (k24_8_FLOAT on the host).
+  if (depth_desc.Format != DXGI_FORMAT_R32G8X24_TYPELESS) {
+    return false;
+  }
+  float inv[16];
+  if (!InvertMatrix4x4(post_sun_view_proj_, inv)) {
+    return false;
+  }
+  float l[3] = {post_sun_dir_[0], post_sun_dir_[1], post_sun_dir_[2]};
+  if (post_sun_shadow_frame_ + 2 >= frame_current_) {
+    for (uint32_t i = 0; i < 3; ++i) l[i] = post_sun_shadow_dir_[i];
+  }
+  float ll = std::sqrt(l[0] * l[0] + l[1] * l[1] + l[2] * l[2]);
+  if (ll < 1e-4f) {
+    return false;
+  }
+  for (float& c : l) c /= ll;
+  auto unproject = [&](float z, float* out) {
+    float h[4];
+    for (uint32_t r = 0; r < 4; ++r) h[r] = inv[r * 4 + 2] * z + inv[r * 4 + 3];
+    if (std::abs(h[3]) < 1e-8f) return false;
+    for (uint32_t r = 0; r < 3; ++r) out[r] = h[r] / h[3];
+    return true;
+  };
+  // Guest clip z runs 0 (near) .. 1 (far) before the viewport flips it.
+  float p_near[3], p_mid[3];
+  if (!unproject(0.0f, p_near) || !unproject(0.5f, p_mid)) {
+    return false;
+  }
+  float fwd[3] = {p_mid[0] - p_near[0], p_mid[1] - p_near[1], p_mid[2] - p_near[2]};
+  float fl = std::sqrt(fwd[0] * fwd[0] + fwd[1] * fwd[1] + fwd[2] * fwd[2]);
+  if (fl < 1e-6f) {
+    return false;
+  }
+  float radius = float(REXCVAR_GET(post_sun_map_radius));
+  float depth_half = float(REXCVAR_GET(post_sun_map_depth));
+  uint32_t size = uint32_t(REXCVAR_GET(post_sun_map_size));
+  // Centre the map ahead of the camera so most of it covers what is visible.
+  float c[3];
+  for (uint32_t i = 0; i < 3; ++i) c[i] = p_near[i] + fwd[i] / fl * radius * 0.6f;
+  float ref[3] = {1.0f, 0.0f, 0.0f};
+  if (std::abs(l[0]) >= 0.9f) {
+    ref[0] = 0.0f;
+    ref[1] = 1.0f;
+  }
+  float right[3] = {ref[1] * l[2] - ref[2] * l[1], ref[2] * l[0] - ref[0] * l[2],
+                    ref[0] * l[1] - ref[1] * l[0]};
+  float rl = std::sqrt(right[0] * right[0] + right[1] * right[1] + right[2] * right[2]);
+  for (float& v : right) v /= rl;
+  float up[3] = {l[1] * right[2] - l[2] * right[1], l[2] * right[0] - l[0] * right[2],
+                 l[0] * right[1] - l[1] * right[0]};
+  bool flip = REXCVAR_GET(post_sun_map_flip);
+  if (flip) {
+    for (float& v : up) v = -v;
+  }
+  auto dot3 = [](const float* a, const float* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; };
+  // Snap the centre to whole texels across the map, so shadow edges do not
+  // crawl as the camera moves.
+  float texel = 2.0f * radius / float(size);
+  float cr = std::floor(dot3(right, c) / texel) * texel;
+  float cu = std::floor(dot3(up, c) / texel) * texel;
+  float cl_ = dot3(l, c);
+  for (uint32_t i = 0; i < 3; ++i) c[i] = right[i] * cr + up[i] * cu + l[i] * cl_;
+  // World -> sun clip: x, y across (-1..1), z along the sun (0 far .. 1 toward
+  // the sun, so the pre-pass's reversed-Z "greater" test keeps the surface
+  // nearest the sun).
+  float h[16] = {right[0] / radius, right[1] / radius, right[2] / radius, -cr / radius,
+                 up[0] / radius,    up[1] / radius,    up[2] / radius,    -cu / radius,
+                 l[0] / (2.0f * depth_half), l[1] / (2.0f * depth_half),
+                 l[2] / (2.0f * depth_half), 0.5f - cl_ / (2.0f * depth_half),
+                 0.0f, 0.0f, 0.0f, 1.0f};
+  for (uint32_t r = 0; r < 4; ++r) {
+    for (uint32_t col = 0; col < 4; ++col) {
+      float s = 0.0f;
+      for (uint32_t k = 0; k < 4; ++k) s += h[r * 4 + k] * inv[k * 4 + col];
+      sun_map_hc_[r * 4 + col] = s;
+    }
+  }
+  std::memcpy(sun_map_center_, c, sizeof(c));
+  std::memcpy(sun_map_dir_, l, sizeof(l));
+  sun_map_radius_ = flip ? -radius : radius;  // the shader reads the sign
+  sun_map_depth_ = depth_half;
+
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (sun_map_ && (sun_map_size_ != size || sun_map_samples_ != depth_desc.SampleDesc.Count ||
+                   sun_map_format_ != depth_desc.Format)) {
+    sun_map_->AddRef();
+    resources_for_deletion_.emplace_back(submission_current_, sun_map_.Get());
+    sun_map_.Reset();
+  }
+  if (!sun_map_) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = size;
+    desc.Height = size;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = depth_desc.Format;
+    desc.SampleDesc.Count = depth_desc.SampleDesc.Count;
+    desc.SampleDesc.Quality = depth_desc.SampleDesc.Quality;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+    D3D12_CLEAR_VALUE clear = {};
+    clear.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, provider.GetHeapFlagCreateNotZeroed(), &desc,
+            D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear, IID_PPV_ARGS(&sun_map_)))) {
+      REXGPU_ERROR("Failed to create the sun shadow map");
+      return false;
+    }
+    if (!sun_map_dsv_heap_) {
+      D3D12_DESCRIPTOR_HEAP_DESC heap_desc = {};
+      heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_DSV;
+      heap_desc.NumDescriptors = 1;
+      if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&sun_map_dsv_heap_)))) {
+        sun_map_.Reset();
+        return false;
+      }
+    }
+    D3D12_DEPTH_STENCIL_VIEW_DESC dsv = {};
+    dsv.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    dsv.ViewDimension = desc.SampleDesc.Count > 1 ? D3D12_DSV_DIMENSION_TEXTURE2DMS
+                                                  : D3D12_DSV_DIMENSION_TEXTURE2D;
+    device->CreateDepthStencilView(sun_map_.Get(), &dsv,
+                                   sun_map_dsv_heap_->GetCPUDescriptorHandleForHeapStart());
+    sun_map_size_ = size;
+    sun_map_samples_ = desc.SampleDesc.Count;
+    sun_map_format_ = desc.Format;
+    sun_map_srv_state_ = false;
+  }
+  if (sun_map_srv_state_) {
+    PushTransitionBarrier(sun_map_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                          D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    sun_map_srv_state_ = false;
+    SubmitBarriers();
+  }
+  deferred_command_list_.D3DClearDepthStencilView(
+      sun_map_dsv_heap_->GetCPUDescriptorHandleForHeapStart(),
+      D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
+  sun_map_draws_ = 0;
+  sun_map_frame_ = frame_current_;
+  sun_map_setup_ok_ = true;
+  return true;
+}
+
+void D3D12CommandProcessor::ReplayDrawIntoSunMap(const D3D12Shader* vertex_shader,
+                                                 const D3D12Shader* pixel_shader,
+                                                 ID3D12RootSignature* root_signature,
+                                                 const draw_util::ViewportInfo& viewport_info,
+                                                 bool indexed, uint32_t vertex_count) {
+  // The translated vertex shader ends with pos.xyz = pos.xyz * ndc_scale +
+  // ndc_offset * pos.w; undo that so the redrawn position comes out exactly
+  // in sun clip space: c0..c3 (the guest's clip = c_i . position) become
+  // Ninv * (sun clip <- camera clip) * C.
+  float ninv[16] = {};
+  for (uint32_t i = 0; i < 3; ++i) {
+    float s = viewport_info.ndc_scale[i];
+    if (std::abs(s) < 1e-12f) return;
+    ninv[i * 4 + i] = 1.0f / s;
+    ninv[i * 4 + 3] = -viewport_info.ndc_offset[i] / s;
+  }
+  ninv[15] = 1.0f;
+  float a[16];
+  for (uint32_t r = 0; r < 4; ++r) {
+    for (uint32_t col = 0; col < 4; ++col) {
+      float s = 0.0f;
+      for (uint32_t k = 0; k < 4; ++k) s += ninv[r * 4 + k] * sun_map_hc_[k * 4 + col];
+      a[r * 4 + col] = s;
+    }
+  }
+  RegisterFile& regs = *register_file_;
+  uint32_t saved[16];
+  float m[16];
+  for (uint32_t i = 0; i < 16; ++i) {
+    saved[i] = regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i];
+    std::memcpy(&m[i], &saved[i], sizeof(float));
+  }
+  for (uint32_t r = 0; r < 4; ++r) {
+    for (uint32_t col = 0; col < 4; ++col) {
+      float s = 0.0f;
+      for (uint32_t k = 0; k < 4; ++k) s += a[r * 4 + k] * m[k * 4 + col];
+      std::memcpy(&regs[XE_GPU_REG_SHADER_CONSTANT_000_X + r * 4 + col], &s, sizeof(float));
+    }
+  }
+  cbuffer_binding_float_vertex_.up_to_date = false;
+  D3D12_CPU_DESCRIPTOR_HANDLE dsv = sun_map_dsv_heap_->GetCPUDescriptorHandleForHeapStart();
+  deferred_command_list_.D3DOMSetRenderTargets(0, nullptr, FALSE, &dsv);
+  render_target_cache_->InvalidateCommandListRenderTargets();
+  D3D12_VIEWPORT viewport = {0.0f, 0.0f, float(sun_map_size_), float(sun_map_size_), 0.0f, 1.0f};
+  SetViewport(viewport);
+  D3D12_RECT scissor = {0, 0, LONG(sun_map_size_), LONG(sun_map_size_)};
+  SetScissorRect(scissor);
+  bool bound = UpdateBindings(vertex_shader, pixel_shader, root_signature, false);
+  if (bound) {
+    SubmitBarriers();
+    if (indexed) {
+      deferred_command_list_.D3DDrawIndexedInstanced(vertex_count, 1, 0, 0, 0);
+    } else {
+      deferred_command_list_.D3DDrawInstanced(vertex_count, 1, 0, 0);
+    }
+    ++sun_map_draws_;
+  }
+  for (uint32_t i = 0; i < 16; ++i) regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i] = saved[i];
+  cbuffer_binding_float_vertex_.up_to_date = false;
 }
 
 void D3D12CommandProcessor::OnPrimaryBufferEnd() {
@@ -3770,6 +4078,50 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
+    }
+  }
+  // Sun shadow map: draw the depth pre-pass a second time from the sun.
+  if (REXCVAR_GET(post_sun_map) && REXCVAR_GET(post_sun_shadows) && REXCVAR_GET(post_ao) &&
+      REXCVAR_GET(post_grade) && host_render_targets_used && !memexport_used &&
+      !primitive_processing_result.IsTessellated() && normalized_color_mask == 0 &&
+      normalized_depth_control.z_enable && normalized_depth_control.z_write_enable &&
+      (normalized_depth_control.zfunc == xenos::CompareFunction::kGreater ||
+       normalized_depth_control.zfunc == xenos::CompareFunction::kGreaterEqual) &&
+      sun_map_scene_depth_frame_ != frame_current_) {
+    float vw = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) * 2.0f;
+    float vh = std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f;
+    // Full-size, wide views only: the game's own (square) shadow maps and
+    // the small water reflection view are left alone.
+    if (vh >= 480.0f && vw >= vh * 1.2f) {
+      static std::string skip_text;
+      static std::vector<uint64_t> skip_hashes;
+      const std::string& skip_cvar = REXCVAR_GET(post_sun_map_skip_vs);
+      if (skip_cvar != skip_text) {
+        skip_text = skip_cvar;
+        skip_hashes.clear();
+        size_t start = 0;
+        while (start < skip_text.size()) {
+          size_t end = skip_text.find(',', start);
+          if (end == std::string::npos) end = skip_text.size();
+          std::string item = skip_text.substr(start, end - start);
+          if (!item.empty()) skip_hashes.push_back(std::strtoull(item.c_str(), nullptr, 16));
+          start = end + 1;
+        }
+      }
+      uint64_t vs_hash = vertex_shader->ucode_data_hash();
+      bool skipped =
+          std::find(skip_hashes.begin(), skip_hashes.end(), vs_hash) != skip_hashes.end();
+      // Between redraws the last map is reused (see post_sun_map_interval).
+      uint64_t interval = uint64_t(std::max(1, REXCVAR_GET(post_sun_map_interval)));
+      skipped |= sun_map_frame_ != UINT64_MAX && sun_map_frame_ != frame_current_ &&
+                 frame_current_ < sun_map_frame_ + interval;
+      if (!skipped && SetupSunMapFrame()) {
+        ReplayDrawIntoSunMap(
+            vertex_shader, pixel_shader, root_signature, viewport_info,
+            primitive_processing_result.index_buffer_type !=
+                PrimitiveProcessor::ProcessedIndexBufferType::kNone,
+            primitive_processing_result.host_draw_vertex_count);
+      }
     }
   }
   // Hand the draw (and everything before it) to the recording thread.

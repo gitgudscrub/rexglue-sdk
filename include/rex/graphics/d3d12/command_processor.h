@@ -628,9 +628,9 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t ao_mode;
     float bloom_threshold;
     float bloom_strength;
-    uint32_t pad_sun[24];  // same size as PostAoConstants
+    uint32_t pad_sun[32];  // same size as PostAoConstants
   };
-  // post_ao.cs.hlsl, same root signature (40 root constants).
+  // post_ao.cs.hlsl, same root signature (48 root constants).
   struct PostAoConstants {
     uint32_t depth_size[2];
     uint32_t ao_size[2];
@@ -653,6 +653,11 @@ class D3D12CommandProcessor : public CommandProcessor {
     float inv_view_proj[16];
     float sun_clip[4];
     float sun_world[4];
+    // Sun shadow map (post_sun_map): centre xyz and half width (negative:
+    // up axis flipped); half depth, size, bias texels, mode (0 off, 1 on,
+    // 2 debug coverage).
+    float sun_map[4];
+    float sun_map2[4];
   };
   static_assert(sizeof(PostAoConstants) == sizeof(PostGradeConstants));
   enum class PostGradeRootParameter : UINT {
@@ -710,6 +715,36 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t post_sun_shadow_frame_ = 0;
   uint64_t post_sun_frame_ = 0;
   bool post_sun_logged_ = false;
+
+  // Sun shadow map (post_sun_map): the game's depth pre-pass draws are drawn a
+  // second time from the sun into this map (same depth format and sample
+  // count as the scene depth, so the guest pipeline is reused unchanged), and
+  // the AO pass looks the scene up in it. See ReplayDrawIntoSunMap.
+  bool SetupSunMapFrame();
+  void ReplayDrawIntoSunMap(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
+                            ID3D12RootSignature* root_signature,
+                            const draw_util::ViewportInfo& viewport_info,
+                            bool indexed, uint32_t vertex_count);
+  Microsoft::WRL::ComPtr<ID3D12Resource> sun_map_;
+  Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> sun_map_dsv_heap_;
+  uint32_t sun_map_size_ = 0;
+  UINT sun_map_samples_ = 0;
+  DXGI_FORMAT sun_map_format_ = DXGI_FORMAT_UNKNOWN;
+  bool sun_map_srv_state_ = false;  // in NON_PIXEL_SHADER_RESOURCE (else DEPTH_WRITE)
+  uint64_t sun_map_setup_frame_ = UINT64_MAX;  // frame SetupSunMapFrame ran for
+  bool sun_map_setup_ok_ = false;
+  uint64_t sun_map_frame_ = UINT64_MAX;        // frame something was drawn into it
+  uint64_t sun_map_scene_depth_frame_ = UINT64_MAX;  // frame the scene depth was captured
+  uint32_t sun_map_draws_ = 0;
+  bool sun_map_logged_ = false;
+  // world -> sun map NDC (row-major) times the camera's clip -> world, the
+  // map's centre / half size / half depth and the sun direction it was built
+  // for (the AO pass rebuilds the same basis from these).
+  float sun_map_hc_[16] = {};
+  float sun_map_center_[3] = {};
+  float sun_map_radius_ = 0.0f;
+  float sun_map_depth_ = 0.0f;
+  float sun_map_dir_[3] = {};
 
   // Vertex buffers seen in draws, by guest address: when one is seen with
   // pages the CPU wrote since its last upload, it is dynamic (a skinned

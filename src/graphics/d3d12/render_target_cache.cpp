@@ -4806,6 +4806,16 @@ void D3D12RenderTargetCache::SetCommandListRenderTargets(
   }
 }
 
+ID3D12Resource* D3D12RenderTargetCache::GetCurrentDepthResource() const {
+  if (!are_current_command_list_render_targets_valid_ || !current_command_list_render_targets_[0]) {
+    return nullptr;
+  }
+  // The array is declared with an extra const* but holds RenderTarget
+  // pointers (memcpy'd from the render targets bound above).
+  auto* depth = reinterpret_cast<const RenderTarget*>(current_command_list_render_targets_[0]);
+  return static_cast<const D3D12RenderTarget*>(depth)->resource();
+}
+
 ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelineKey key) {
   auto pipeline_it = dump_pipelines_.find(key);
   if (pipeline_it != dump_pipelines_.end()) {

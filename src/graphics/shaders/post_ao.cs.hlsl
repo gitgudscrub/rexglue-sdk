@@ -35,15 +35,24 @@ cbuffer PostAoConstants : register(b0) {
   float4 sun_clip;      // clip-space change per world unit toward the sun
   float4 sun_world;     // xyz: world direction toward the sun; w: world-space
                         // AO radius in world units (0 = near-plane AO below)
+  // Sun shadow map (see SunMapShadow): centre xyz, half width w (negative:
+  // up axis flipped); half depth along the sun, size, bias texels, mode
+  // (0 off, 1 on, 2 debug coverage).
+  float4 sun_map;
+  float4 sun_map2;
 };
 
 // The game's scene depth is multisampled; the MSAA variant (fxc /D MSAA=1)
 // reads sample 0.
 #if MSAA
 Texture2DMS<float> depth_in : register(t0);
+Texture2DMS<float> sun_map_tex : register(t2);
+float LoadSunMap(int2 p) { return sun_map_tex.Load(p, 0); }
 float LoadDepth(int2 p) { return depth_in.Load(p, 0); }
 #else
 Texture2D<float> depth_in : register(t0);
+Texture2D<float> sun_map_tex : register(t2);
+float LoadSunMap(int2 p) { return sun_map_tex[p]; }
 float LoadDepth(int2 p) { return depth_in[p]; }
 #endif
 Texture2D<float2> ao_in : register(t1);
@@ -126,6 +135,74 @@ float SunShadow(int2 p, float d, float noise) {
   return 1.0 - sun_strength * shadow * saturate(ndl * 4.0);
 }
 
+// --- sun shadow map ---------------------------------------------------------
+// D3D12CommandProcessor::ReplayDrawIntoSunMap draws the game's depth pre-pass
+// a second time from the sun into a square orthographic map (reversed Z: the
+// stored depth is larger toward the sun). Returns -1 outside the map, where
+// the screen-space march takes over.
+float SunMapShadow(int2 p, float d) {
+  float2 ndc0 = NdcOf(float2(p) + 0.5);
+  float4 h = WorldH(ndc0, d);
+  float3 pos = h.xyz / h.w;
+  float3 dx = WorldPos(p + int2(1, 0)) - pos, dx2 = pos - WorldPos(p - int2(1, 0));
+  float3 dy = WorldPos(p + int2(0, 1)) - pos, dy2 = pos - WorldPos(p - int2(0, 1));
+  if (dot(dx2, dx2) < dot(dx, dx)) dx = dx2;
+  if (dot(dy2, dy2) < dot(dy, dy)) dy = dy2;
+  float3 n = normalize(cross(dy, dx));
+  float4 hn = WorldH(ndc0, reversed_z != 0 ? 1.0 : 0.0);
+  if (dot(n, hn.xyz / hn.w - pos) < 0.0) n = -n;
+  float3 l = sun_world.xyz;
+  float ndl = dot(n, l);
+  float3 ref = abs(l.x) < 0.9 ? float3(1.0, 0.0, 0.0) : float3(0.0, 1.0, 0.0);
+  float3 right = normalize(cross(ref, l));
+  float3 up = cross(l, right);
+  float radius = abs(sun_map.w);
+  if (sun_map.w < 0.0) up = -up;
+  float depth_half = sun_map2.x;
+  float size = sun_map2.y;
+  float bias_texels = sun_map2.z;
+  bool debug = sun_map2.w > 1.5;
+  float texel = 2.0 * radius / size;
+  // Normal offset: step off the surface so it does not shadow itself.
+  float3 v = pos + n * (texel * bias_texels) - sun_map.xyz;
+  float x = dot(right, v) / radius, y = dot(up, v) / radius;
+  float z = dot(l, v) / (2.0 * depth_half) + 0.5;
+  float edge = max(abs(x), abs(y));
+  if (edge >= 1.0 || z >= 1.0 || z <= 0.0) {
+    return debug ? 0.5 : -1.0;  // debug: grey outside the map
+  }
+  if (ndl < 0.05 && !debug) return 1.0;
+  float2 uv = float2(x * 0.5 + 0.5, 0.5 - y * 0.5) * size - 0.5;
+  float z_bias = texel * bias_texels / (2.0 * depth_half);
+  int2 base = int2(floor(uv));
+  float2 f = uv - float2(base);
+  // 4x4 taps, bilinear-weighted 3x3 PCF.
+  float lit[4][4];
+  [unroll] for (int j = 0; j < 4; ++j) {
+    [unroll] for (int i = 0; i < 4; ++i) {
+      int2 q = clamp(base + int2(i - 1, j - 1), int2(0, 0), int2(size, size) - 1);
+      lit[j][i] = LoadSunMap(q) > z + z_bias ? 0.0 : 1.0;
+    }
+  }
+  float sum = 0.0;
+  [unroll] for (int j2 = 0; j2 < 3; ++j2) {
+    [unroll] for (int i2 = 0; i2 < 3; ++i2) {
+      float top = lerp(lit[j2][i2], lit[j2][i2 + 1], f.x);
+      float bottom = lerp(lit[j2 + 1][i2], lit[j2 + 1][i2 + 1], f.x);
+      sum += lerp(top, bottom, f.y);
+    }
+  }
+  float shadow = 1.0 - sum / 9.0;
+  if (debug) return 1.0 - shadow * 0.8;  // bright = lit, dark = shadowed
+  float result = 1.0 - sun_strength * shadow * saturate(ndl * 4.0);
+  // Blend into the screen-space march near the map's edge.
+  float blend = smoothstep(0.85, 1.0, edge);
+  if (blend > 0.0) {
+    result = lerp(result, sun_enabled != 0 ? SunShadow(p, d, 0.5) : 1.0, blend);
+  }
+  return result;
+}
+
 // --- world-space ao -----------------------------------------------------------
 // With the game's camera the radius is in world units, so a rock gets the same
 // contact shading near and far (the near-plane AO can only reach a few pixels
@@ -187,7 +264,8 @@ void ao(uint3 id : SV_DispatchThreadID) {
     return;
   }
   float noise = frac(52.9829189 * frac(dot(float2(id.xy), float2(0.06711056, 0.00583715))));
-  float sun = sun_enabled != 0 ? SunShadow(p, d, noise) : 1.0;
+  float sun = sun_map2.w > 0.0 ? SunMapShadow(p, d) : -1.0;
+  if (sun < 0.0) sun = sun_enabled != 0 ? SunShadow(p, d, noise) : 1.0;
   if (sun_world.w > 0.0) {
     ao_out[id.xy] = float2(WorldAo(p, d, noise, sun_world.w) * sun, ViewPos(p).z);
     return;

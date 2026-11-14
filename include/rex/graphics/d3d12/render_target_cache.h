@@ -66,6 +66,8 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
   void InvalidateCommandListRenderTargets() {
     are_current_command_list_render_targets_valid_ = false;
   }
+  // The depth render target the last Update bound, or null.
+  ID3D12Resource* GetCurrentDepthResource() const;
 
   bool msaa_2x_supported() const { return msaa_2x_supported_; }
 

@@ -14,6 +14,16 @@
 //   bloom_blur_h  quarter-res highlights, horizontal           (t1 -> u0)
 //   bloom_blur_v  same, vertical                               (t1 -> u0)
 //
+// Optional light shafts (shafts_sun.z > 0), in the bloom textures instead:
+//
+//   shafts_mask    sky near the sun, quarter res          (t0, t3 -> u0)
+//   shafts_coarse  radial blur toward the sun, long steps  (t1 -> u0)
+//   shafts_fine    the same with short steps (fills gaps)   (t1 -> u0)
+//
+// Optional distance dehaze (haze_params.x > 0), after the mean:
+//
+//   haze           colour of the far, fogged scene, smoothed  (t0, t3 -> u1)
+//
 // The grade writes perceptual luma to alpha so the SDK's FXAA pass can run
 // on its output (post_aa).
 //
@@ -38,6 +48,16 @@ cbuffer PostGradeConstants : register(b0) {
   uint ao_mode;       // grade: 0 no AO, 1 apply, 2 show AO, 3 show AO depth
   float bloom_threshold;  // highlight luma where bloom starts
   float bloom_strength;   // 0 = no bloom
+  // Light shafts: sun position in frame UV (may lie off screen), strength
+  // (0 = off), radius of the sky around the sun that feeds them (in frame
+  // heights); ray length (fraction of the way to the sun), per-sample decay,
+  // sky brightness threshold, unused.
+  float4 shafts_sun;
+  float4 shafts_params;
+  // Distance dehaze: amount of the fog removed at full distance (0 = off),
+  // view depth where it starts and where it is full (near-plane units, as in
+  // the AO texture), debug view (1 = show the amount).
+  float4 haze_params;
 };
 
 Texture2D<float4> source : register(t0);
@@ -54,6 +74,10 @@ RWTexture2D<float> mean_out : register(u1);
 // Single-channel destination for the luma passes (same slot as dest; each
 // entry point uses only one of them).
 RWTexture2D<float> dest_luma : register(u0);
+// Distance dehaze: the fog colour (1x1), written by `haze` (same slot as
+// mean_out) and read by the grade.
+RWTexture2D<float4> haze_out : register(u1);
+Texture2D<float4> haze_tex : register(t5);
 SamplerState linear_clamp : register(s0);
 
 float Luma(float3 c) { return dot(c, float3(0.2126, 0.7152, 0.0722)); }
@@ -172,6 +196,105 @@ void bloom_blur_v(uint3 id : SV_DispatchThreadID) {
   dest[id.xy] = float4(BloomBlurAlong(int2(id.xy), int2(0, 1)), 1.0);
 }
 
+// --- light shafts ------------------------------------------------------------
+// Bright sky seen around the sun, smeared along lines toward the sun: where
+// leaves, branches or buildings cut the sky the smear leaves dark gaps, which
+// read as beams of light through the trees.
+static const uint kShaftSamples = 24;
+
+[numthreads(8, 8, 1)]
+void shafts_mask(uint3 id : SV_DispatchThreadID) {
+  if (any(id.xy >= small_size)) return;
+  float3 sum = 0.0;
+  float sky = 0.0;
+  uint2 base = id.xy * 4;
+  for (uint y = 0; y < 4; ++y) {
+    for (uint x = 0; x < 4; ++x) {
+      uint2 q = min(base + uint2(x, y), size - 1);
+      float2 quv = (float2(q) + 0.5) / float2(size);
+      float is_sky = ao_tex.SampleLevel(linear_clamp, quv, 0.0).y > 50000.0 ? 1.0 : 0.0;
+      sum += source[q].rgb * is_sky;
+      sky += is_sky;
+    }
+  }
+  float3 c = sum / 16.0;
+  float2 uv = (float2(id.xy) + 0.5) / float2(small_size);
+  float aspect = float(size.x) / float(size.y);
+  float2 d = (uv - shafts_sun.xy) * float2(aspect, 1.0);
+  float near_sun = saturate(1.0 - length(d) / max(shafts_sun.w, 1e-3));
+  float k = saturate((Luma(c) - shafts_params.z) / max(1.0 - shafts_params.z, 1e-3));
+  dest[id.xy] = float4(c * k * near_sun * near_sun, 1.0);
+}
+
+float3 ShaftBlur(uint2 id, float step_scale) {
+  float2 uv = (float2(id) + 0.5) / float2(small_size);
+  float2 delta = (shafts_sun.xy - uv) * shafts_params.x * step_scale / float(kShaftSamples);
+  float3 sum = 0.0;
+  float w = 1.0, wsum = 0.0;
+  for (uint i = 0; i < kShaftSamples; ++i) {
+    sum += bloom_in.SampleLevel(linear_clamp, uv + delta * float(i), 0.0).rgb * w;
+    wsum += w;
+    w *= shafts_params.y;
+  }
+  return sum / wsum;
+}
+
+[numthreads(8, 8, 1)]
+void shafts_coarse(uint3 id : SV_DispatchThreadID) {
+  if (any(id.xy >= small_size)) return;
+  dest[id.xy] = float4(ShaftBlur(id.xy, 1.0), 1.0);
+}
+
+[numthreads(8, 8, 1)]
+void shafts_fine(uint3 id : SV_DispatchThreadID) {
+  if (any(id.xy >= small_size)) return;
+  dest[id.xy] = float4(ShaftBlur(id.xy, 1.0 / float(kShaftSamples)), 1.0);
+}
+
+// --- distance dehaze ---------------------------------------------------------
+// The game's fog blends distant pixels toward one colour. Average the frame
+// weighted toward far (non-sky) depth to find that colour, smoothed over
+// frames; the grade then takes part of it back out by distance.
+float HazeAmount(float z) {
+  if (z > 50000.0) return 0.0;  // sky
+  return haze_params.x * smoothstep(haze_params.y, haze_params.z, z);
+}
+
+groupshared float4 g_haze[256];
+
+[numthreads(16, 16, 1)]
+void haze(uint3 gtid : SV_GroupThreadID) {
+  uint index = gtid.y * 16 + gtid.x;
+  float4 sum = 0.0;
+  // 64 x 36 samples over the frame.
+  for (uint y = gtid.y; y < 36; y += 16) {
+    for (uint x = gtid.x; x < 64; x += 16) {
+      float2 uv = (float2(x, y) + 0.5) / float2(64.0, 36.0);
+      float z = ao_tex.SampleLevel(linear_clamp, uv, 0.0).y;
+      // The farthest band (past the full depth) is mostly fog colour.
+      float w = z > 50000.0 ? 0.0 : smoothstep(haze_params.z, haze_params.z * 4.0, z);
+      sum += float4(source[uint2(uv * float2(size))].rgb * w, w);
+    }
+  }
+  g_haze[index] = sum;
+  GroupMemoryBarrierWithGroupSync();
+  for (uint stride = 128; stride > 0; stride >>= 1) {
+    if (index < stride) g_haze[index] += g_haze[index + stride];
+    GroupMemoryBarrierWithGroupSync();
+  }
+  if (index == 0) {
+    float4 s = g_haze[0];
+    float4 old = haze_out[uint2(0, 0)];
+    if (s.w < 1.0) {
+      // Hardly anything far on screen: keep the last colour.
+      haze_out[uint2(0, 0)] = pass_param != 0 ? float4(0.7, 0.75, 0.85, 1.0) : old;
+      return;
+    }
+    float3 c = s.rgb / s.w;
+    haze_out[uint2(0, 0)] = pass_param != 0 ? float4(c, 1.0) : lerp(old, float4(c, 1.0), 0.05);
+  }
+}
+
 // --- grade -----------------------------------------------------------------
 float3 Grade(float3 c, float blurred) {
   c = Dehaze(c);
@@ -231,12 +354,34 @@ void grade(uint3 id : SV_DispatchThreadID) {
       dest[id.xy] = float4(band.xxx, 1.0);
       return;
     }
+    if (haze_params.x > 0.0) {
+      float f = min(HazeAmount(ao.y), 0.85);
+      if (haze_params.w > 0.5) {
+        dest[id.xy] = float4(f.xxx, 1.0);
+        return;
+      }
+      // Take out a half-desaturated fog colour, then cap the colour gain so
+      // the far scene regains contrast without turning garish.
+      float3 a = haze_tex[uint2(0, 0)].rgb;
+      a = lerp(Luma(a).xxx, a, 0.5);
+      float3 r = saturate((c - a * f) / (1.0 - f));
+      float3 chroma_in = c - Luma(c);
+      float3 chroma_out = r - Luma(r);
+      float limit = length(chroma_in) * (1.0 + 0.5 * f) + 0.01;
+      float len = length(chroma_out);
+      if (len > limit) r = Luma(r) + chroma_out * (limit / len);
+      c = saturate(r);
+    }
     // The frame is gamma-encoded: occlusion is linear light, so ^(1/2.2).
     c *= pow(saturate(lerp(1.0, ao.x, ao_strength)), 1.0 / 2.2);
   }
   if (bloom_strength > 0.0) {
     // Screen blend: brightens without clipping.
     float3 b = saturate(bloom_tex.SampleLevel(linear_clamp, uv, 0.0).rgb * bloom_strength);
+    c = 1.0 - (1.0 - saturate(c)) * (1.0 - b);
+  }
+  if (shafts_sun.z > 0.0) {
+    float3 b = saturate(bloom_tex.SampleLevel(linear_clamp, uv, 0.0).rgb * shafts_sun.z);
     c = 1.0 - (1.0 - saturate(c)) * (1.0 - b);
   }
   float3 g = saturate(Grade(saturate(c), blurred) * ExposureScale(mean_luma));

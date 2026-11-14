@@ -628,7 +628,13 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t ao_mode;
     float bloom_threshold;
     float bloom_strength;
-    uint32_t pad_sun[36];  // same size as PostAoConstants
+    // Light shafts: sun UV, strength (0 = off), source radius; ray length,
+    // decay, sky threshold, unused (post_grade.cs.hlsl).
+    float shafts_sun[4];
+    float shafts_params[4];
+    // Distance dehaze: amount, start and full depth, debug.
+    float haze_params[4];
+    uint32_t pad_sun[24];  // same size as PostAoConstants
   };
   // post_ao.cs.hlsl, same root signature (52 root constants).
   struct PostAoConstants {
@@ -673,6 +679,7 @@ class D3D12CommandProcessor : public CommandProcessor {
     kMeanOut,
     kAo,
     kBloom,
+    kHaze,
 
     kCount,
   };
@@ -685,6 +692,10 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_bloom_down_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_bloom_blur_h_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_bloom_blur_v_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_shafts_mask_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_shafts_coarse_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_shafts_fine_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_haze_pipeline_;
   // All kept in NON_PIXEL_SHADER_RESOURCE between passes and frames.
   // Full-res copy of the gamma-corrected frame (kFxaaSourceTextureFormat).
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_source_texture_;
@@ -692,6 +703,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_luma_textures_[2];
   // 1x1 smoothed average luma (R32_FLOAT).
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_mean_texture_;
+  // Distance dehaze: fog colour, 1x1 RGBA16F, smoothed across frames.
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_haze_texture_;
+  bool post_grade_haze_valid_ = false;
   // Quarter-res R16G16B16A16_FLOAT bloom, ping-pong; result in [0].
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_bloom_textures_[2];
   uint64_t post_grade_submission_ = 0;
@@ -704,6 +718,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12Resource> post_ao_textures_[2];
   // Frame in which post_ao_textures_[0] was last filled (0 = never).
   uint64_t post_ao_frame_ = 0;
+  // Sun position in frame UV for the light shafts, from the AO pass's camera.
+  float post_shafts_uv_[2] = {};
+  uint64_t post_shafts_frame_ = UINT64_MAX;
   bool post_ao_logged_ = false;
   // Camera and sun captured from the ground draws for the sun shadows:
   // vertex constants c0..c3 (world -> clip rows), pixel constant c80

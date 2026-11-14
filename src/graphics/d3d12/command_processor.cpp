@@ -119,6 +119,47 @@ REXCVAR_DEFINE_DOUBLE(post_bloom_threshold, 0.8, "GPU/D3D12",
                       "Bloom: brightness (0..1) where highlights start to glow")
     .range(0.0, 0.99)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_dehaze_far, 0.0, "GPU/D3D12",
+                      "Grade: how much of the distance fog is taken back out at full distance "
+                      "(0 = off; needs post_ao for the depth)")
+    .range(0.0, 0.85)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_dehaze_start, 400.0, "GPU/D3D12",
+                      "Grade: view depth where the distance dehaze starts, near-plane units")
+    .range(0.0, 1e9)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_grade_dehaze_end, 4000.0, "GPU/D3D12",
+                      "Grade: view depth where the distance dehaze is full, near-plane units")
+    .range(1.0, 1e9)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_grade_dehaze_debug, false, "GPU/D3D12",
+                    "Grade: show the distance dehaze amount in grey")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_light_shafts, false, "GPU/D3D12",
+                    "Light shafts: bright sky around the sun streaked toward it, so trees and "
+                    "buildings in front of it cast beams (needs post_ao and a sun camera; "
+                    "replaces post_bloom while on)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_light_shafts_strength, 1.5, "GPU/D3D12", "Light shafts: amount")
+    .range(0.0, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_light_shafts_radius, 0.6, "GPU/D3D12",
+                      "Light shafts: radius of the sky around the sun that feeds them, frame "
+                      "heights")
+    .range(0.01, 4.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_light_shafts_length, 0.9, "GPU/D3D12",
+                      "Light shafts: ray length, fraction of the way to the sun")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_light_shafts_decay, 0.96, "GPU/D3D12",
+                      "Light shafts: weight kept per sample along a ray")
+    .range(0.5, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(post_light_shafts_threshold, 0.45, "GPU/D3D12",
+                      "Light shafts: sky brightness where they start")
+    .range(0.0, 0.99)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(post_bloom_strength, 0.3, "GPU/D3D12", "Bloom: glow amount")
     .range(0.0, 4.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
@@ -318,6 +359,10 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/post_grade_bloom_down_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_bloom_blur_h_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_bloom_blur_v_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_shafts_mask_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_shafts_coarse_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_shafts_fine_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_grade_haze_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_ao_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_ao_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_h_cs.h"
@@ -1964,6 +2009,10 @@ void D3D12CommandProcessor::ShutdownContext() {
   post_grade_bloom_down_pipeline_.Reset();
   post_grade_bloom_blur_h_pipeline_.Reset();
   post_grade_bloom_blur_v_pipeline_.Reset();
+  post_grade_shafts_mask_pipeline_.Reset();
+  post_grade_shafts_coarse_pipeline_.Reset();
+  post_grade_shafts_fine_pipeline_.Reset();
+  post_grade_haze_pipeline_.Reset();
   post_grade_mean_pipeline_.Reset();
   post_grade_blur_v_pipeline_.Reset();
   post_grade_blur_h_pipeline_.Reset();
@@ -2585,9 +2634,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           // t0 source, t1 luma, t2 mean, u0 destination, u1 mean out, per pass:
           // down (t0 u0), blur_h (t1 u0), blur_v (t1 u0), mean (t1 u1),
           // grade (t0 t1 t2 u0).
-          // d[13] bloom for the grade, d[14..23] bloom passes, d[24..25] FXAA.
-          ui::d3d12::util::DescriptorCpuGpuHandlePair d[26];
-          if (!RequestOneUseSingleViewDescriptors(26, d)) {
+          // d[13] bloom for the grade, d[14..23] bloom passes, d[24..25] FXAA,
+          // d[26] haze out, d[27] haze for the grade.
+          ui::d3d12::util::DescriptorCpuGpuHandlePair d[28];
+          if (!RequestOneUseSingleViewDescriptors(28, d)) {
             // Show the ungraded frame.
             PushTransitionBarrier(apply_gamma_dest, apply_gamma_dest_initial_state,
                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -2636,12 +2686,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               uav(guest_output_resource, ui::d3d12::D3D12Presenter::kGuestOutputFormat,
                   d[11].first);
             }
-            bool use_bloom = REXCVAR_GET(post_bloom) && post_grade_bloom_textures_[0] &&
-                             post_grade_bloom_down_pipeline_;
+            // AO only if it was computed for this frame (no scene depth in
+            // menus and loading screens).
+            bool use_ao = REXCVAR_GET(post_ao) && post_ao_textures_[0] &&
+                          post_ao_frame_ == frame_current_;
+            // Light shafts need the AO's sky mask and the sun's screen
+            // position from the same frame; they use the bloom textures.
+            bool use_shafts = REXCVAR_GET(post_light_shafts) && use_ao &&
+                              post_shafts_frame_ == frame_current_ &&
+                              post_grade_bloom_textures_[0] && post_grade_shafts_mask_pipeline_;
+            bool use_bloom = !use_shafts && REXCVAR_GET(post_bloom) &&
+                             post_grade_bloom_textures_[0] && post_grade_bloom_down_pipeline_;
             ID3D12Resource* bloom0 = post_grade_bloom_textures_[0].Get();
             ID3D12Resource* bloom1 = post_grade_bloom_textures_[1].Get();
             const DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
-            if (use_bloom) {
+            if (use_bloom || use_shafts) {
               srv(bloom0, kBloomFormat, d[13].first);
               // bloom_down: t0 frame -> bloom0; then (h: bloom0 -> bloom1,
               // v: bloom1 -> bloom0) twice for a wider glow.
@@ -2661,10 +2720,20 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
               null_desc.Texture2D.MipLevels = 1;
               device->CreateShaderResourceView(nullptr, &null_desc, d[13].first);
             }
-            // AO only if it was computed for this frame (no scene depth in
-            // menus and loading screens).
-            bool use_ao = REXCVAR_GET(post_ao) && post_ao_textures_[0] &&
-                          post_ao_frame_ == frame_current_;
+            bool use_haze = use_ao && REXCVAR_GET(post_grade_dehaze_far) > 0.0 &&
+                            post_grade_haze_texture_ && post_grade_haze_pipeline_;
+            ID3D12Resource* haze_texture = post_grade_haze_texture_.Get();
+            if (use_haze) {
+              uav(haze_texture, DXGI_FORMAT_R16G16B16A16_FLOAT, d[26].first);
+              srv(haze_texture, DXGI_FORMAT_R16G16B16A16_FLOAT, d[27].first);
+            } else {
+              D3D12_SHADER_RESOURCE_VIEW_DESC null_desc = {};
+              null_desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+              null_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+              null_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+              null_desc.Texture2D.MipLevels = 1;
+              device->CreateShaderResourceView(nullptr, &null_desc, d[27].first);
+            }
             if (use_ao) {
               srv(post_ao_textures_[0].Get(), DXGI_FORMAT_R16G16_FLOAT, d[12].first);
             } else {
@@ -2694,6 +2763,21 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             constants.ao_mode = use_ao ? 1 + uint32_t(REXCVAR_GET(post_ao_debug)) : 0;
             constants.bloom_threshold = float(REXCVAR_GET(post_bloom_threshold));
             constants.bloom_strength = use_bloom ? float(REXCVAR_GET(post_bloom_strength)) : 0.0f;
+            if (use_haze) {
+              constants.haze_params[0] = float(REXCVAR_GET(post_grade_dehaze_far));
+              constants.haze_params[1] = float(REXCVAR_GET(post_grade_dehaze_start));
+              constants.haze_params[2] = float(REXCVAR_GET(post_grade_dehaze_end));
+              constants.haze_params[3] = REXCVAR_GET(post_grade_dehaze_debug) ? 1.0f : 0.0f;
+            }
+            if (use_shafts) {
+              constants.shafts_sun[0] = post_shafts_uv_[0];
+              constants.shafts_sun[1] = post_shafts_uv_[1];
+              constants.shafts_sun[2] = float(REXCVAR_GET(post_light_shafts_strength));
+              constants.shafts_sun[3] = float(REXCVAR_GET(post_light_shafts_radius));
+              constants.shafts_params[0] = float(REXCVAR_GET(post_light_shafts_length));
+              constants.shafts_params[1] = float(REXCVAR_GET(post_light_shafts_decay));
+              constants.shafts_params[2] = float(REXCVAR_GET(post_light_shafts_threshold));
+            }
 
             deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());
             deferred_command_list_.D3DSetComputeRoot32BitConstants(
@@ -2730,6 +2814,25 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             table(PostGradeRootParameter::kLuma, d[6]);
             table(PostGradeRootParameter::kMeanOut, d[7]);
             pass(post_grade_mean_pipeline_.Get(), mean_texture, kRead, 1, 1);
+            if (use_haze) {
+              // haze: frame + AO depth -> fog colour. pass_param marks the
+              // first frame for it too, so set it from its own flag.
+              if (post_grade_haze_valid_ != (constants.pass_param == 0)) {
+                PostGradeConstants haze_constants = constants;
+                haze_constants.pass_param = post_grade_haze_valid_ ? 0 : 1;
+                deferred_command_list_.D3DSetComputeRoot32BitConstants(
+                    UINT(PostGradeRootParameter::kConstants),
+                    sizeof(haze_constants) / sizeof(uint32_t), &haze_constants, 0);
+              }
+              table(PostGradeRootParameter::kSource, d[0]);
+              table(PostGradeRootParameter::kAo, d[12]);
+              table(PostGradeRootParameter::kMeanOut, d[26]);
+              pass(post_grade_haze_pipeline_.Get(), haze_texture, kRead, 1, 1);
+              deferred_command_list_.D3DSetComputeRoot32BitConstants(
+                  UINT(PostGradeRootParameter::kConstants), sizeof(constants) / sizeof(uint32_t),
+                  &constants, 0);
+              post_grade_haze_valid_ = true;
+            }
             if (use_bloom) {
               table(PostGradeRootParameter::kSource, d[14]);
               table(PostGradeRootParameter::kDestination, d[15]);
@@ -2746,6 +2849,23 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
                      small_groups_y);
               }
             }
+            if (use_shafts) {
+              // shafts_mask: frame + AO sky -> bloom0; coarse bloom0 -> bloom1;
+              // fine bloom1 -> bloom0.
+              table(PostGradeRootParameter::kSource, d[14]);
+              table(PostGradeRootParameter::kAo, d[12]);
+              table(PostGradeRootParameter::kDestination, d[15]);
+              pass(post_grade_shafts_mask_pipeline_.Get(), bloom0, kRead, small_groups_x,
+                   small_groups_y);
+              table(PostGradeRootParameter::kLuma, d[16]);
+              table(PostGradeRootParameter::kDestination, d[17]);
+              pass(post_grade_shafts_coarse_pipeline_.Get(), bloom1, kRead, small_groups_x,
+                   small_groups_y);
+              table(PostGradeRootParameter::kLuma, d[18]);
+              table(PostGradeRootParameter::kDestination, d[19]);
+              pass(post_grade_shafts_fine_pipeline_.Get(), bloom0, kRead, small_groups_x,
+                   small_groups_y);
+            }
             // grade: source + luma0 + mean (+ AO, bloom) -> guest output, or
             // the FXAA input with post_aa
             table(PostGradeRootParameter::kSource, d[8]);
@@ -2754,6 +2874,7 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             table(PostGradeRootParameter::kDestination, d[11]);
             table(PostGradeRootParameter::kAo, d[12]);
             table(PostGradeRootParameter::kBloom, d[13]);
+            table(PostGradeRootParameter::kHaze, d[27]);
             uint32_t full_groups_x = (guest_output_width + 15) / 16;
             uint32_t full_groups_y = (guest_output_height + 7) / 8;
             if (use_post_aa) {
@@ -2817,7 +2938,7 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   parameters[0].Constants.Num32BitValues = sizeof(PostGradeConstants) / sizeof(uint32_t);
   parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
   // kSource t0, kLuma t1, kMean t2, kDestination u0, kMeanOut u1, kAo t3,
-  // kBloom t4.
+  // kBloom t4, kHaze t5.
   const struct {
     D3D12_DESCRIPTOR_RANGE_TYPE type;
     UINT reg;
@@ -2827,7 +2948,8 @@ bool D3D12CommandProcessor::InitializePostGrade() {
                 {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0},
                 {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1},
                 {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 3},
-                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4}};
+                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4},
+                {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5}};
   for (UINT i = 1; i < UINT(PostGradeRootParameter::kCount); ++i) {
     D3D12_DESCRIPTOR_RANGE& range = ranges[i];
     range.RangeType = tables[i - 1].type;
@@ -2873,6 +2995,10 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   REX_POST_GRADE_PIPELINE(post_grade_bloom_down_pipeline_, post_grade_bloom_down_cs)
   REX_POST_GRADE_PIPELINE(post_grade_bloom_blur_h_pipeline_, post_grade_bloom_blur_h_cs)
   REX_POST_GRADE_PIPELINE(post_grade_bloom_blur_v_pipeline_, post_grade_bloom_blur_v_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_shafts_mask_pipeline_, post_grade_shafts_mask_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_shafts_coarse_pipeline_, post_grade_shafts_coarse_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_shafts_fine_pipeline_, post_grade_shafts_fine_cs)
+  REX_POST_GRADE_PIPELINE(post_grade_haze_pipeline_, post_grade_haze_cs)
   REX_POST_GRADE_PIPELINE(post_ao_pipeline_, post_ao_ao_cs)
   REX_POST_GRADE_PIPELINE(post_ao_ms_pipeline_, post_ao_ao_ms_cs)
   REX_POST_GRADE_PIPELINE(post_ao_blur_h_pipeline_, post_ao_blur_h_cs)
@@ -2884,6 +3010,7 @@ bool D3D12CommandProcessor::InitializePostGrade() {
 void D3D12CommandProcessor::ReleasePostGradeTextures() {
   ID3D12Resource* textures[] = {post_grade_source_texture_.Get(), post_grade_luma_textures_[0].Get(),
                                 post_grade_luma_textures_[1].Get(), post_grade_mean_texture_.Get(),
+                                post_grade_haze_texture_.Get(),
                                 post_grade_bloom_textures_[0].Get(),
                                 post_grade_bloom_textures_[1].Get()};
   for (ID3D12Resource* texture : textures) {
@@ -2896,6 +3023,7 @@ void D3D12CommandProcessor::ReleasePostGradeTextures() {
   post_grade_luma_textures_[0].Reset();
   post_grade_luma_textures_[1].Reset();
   post_grade_mean_texture_.Reset();
+  post_grade_haze_texture_.Reset();
   post_grade_bloom_textures_[0].Reset();
   post_grade_bloom_textures_[1].Reset();
   post_grade_mean_valid_ = false;
@@ -2932,6 +3060,7 @@ bool D3D12CommandProcessor::EnsurePostGradeTextures(uint32_t width, uint32_t hei
       !create(small_width, small_height, DXGI_FORMAT_R16_FLOAT, post_grade_luma_textures_[0]) ||
       !create(small_width, small_height, DXGI_FORMAT_R16_FLOAT, post_grade_luma_textures_[1]) ||
       !create(1, 1, DXGI_FORMAT_R32_FLOAT, post_grade_mean_texture_) ||
+      !create(1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, post_grade_haze_texture_) ||
       !create(small_width, small_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
               post_grade_bloom_textures_[0]) ||
       !create(small_width, small_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
@@ -2941,6 +3070,7 @@ bool D3D12CommandProcessor::EnsurePostGradeTextures(uint32_t width, uint32_t hei
     return false;
   }
   post_grade_mean_valid_ = false;
+  post_grade_haze_valid_ = false;
   return true;
 }
 
@@ -3162,6 +3292,15 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
       constants.sun_world[1] = l[1];
       constants.sun_world[2] = l[2];
       constants.sun_y_down = post_sun_yscale_ > 0.0f ? 1 : 0;
+      // Light shafts: where the sun sits on screen (a direction, so w = 0
+      // in; behind the camera when the clip w is not positive).
+      if (constants.sun_clip[3] > 1e-4f) {
+        float nx = constants.sun_clip[0] / constants.sun_clip[3];
+        float ny = constants.sun_clip[1] / constants.sun_clip[3];
+        post_shafts_uv_[0] = nx * 0.5f + 0.5f;
+        post_shafts_uv_[1] = constants.sun_y_down ? ny * 0.5f + 0.5f : 0.5f - ny * 0.5f;
+        post_shafts_frame_ = frame_current_;
+      }
       if (!post_sun_logged_) {
         post_sun_logged_ = true;
         REXGPU_INFO(

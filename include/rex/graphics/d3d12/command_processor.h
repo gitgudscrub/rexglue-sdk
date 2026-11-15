@@ -787,6 +787,8 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_ambient_ms_pipeline_;
   bool sparrow_logged_ = false;
 
+  // Fallback when the character_vs cvar is empty (it is the reliable test:
+  // this one also flags scenery whose vertex pages the game rewrites).
   // Vertex buffers seen in draws, by guest address: when one is seen with
   // pages the CPU wrote since its last upload, it is dynamic (a skinned
   // character mesh) and its draws get kSysFlag_DynamicMesh for a while after

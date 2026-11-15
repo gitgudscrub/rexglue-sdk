@@ -81,10 +81,45 @@ REXCVAR_DEFINE_INT32(log_frame_textures, 0, "GPU/D3D12",
                      "the next N frames, with draw counts; texture hashes are the texture pack's "
                      "dump names")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+// Fable II's skinned vertex shaders (4 bones): people, creatures, the dog,
+// and animated props such as banners and swinging lanterns. Found with
+// log_frame_shaders in Bowerstone Market (the dyn column) and checked with
+// the lit shaders' DEBUG_VIEW 6.
+REXCVAR_DEFINE_STRING(character_vs, "D4D558DA6A82BDC8,A1F7E9885EC466DF,79EAC49585797037",
+                      "GPU/D3D12",
+                      "Comma-separated vertex shader hashes (16 hex digits) whose draws are "
+                      "characters (kSysFlag_DynamicMesh). Empty: guess from vertex buffers the "
+                      "CPU rewrote")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace {
-// log_frame_shaders: (vertex hash, pixel hash) -> (first draw index, draws).
+// character_vs, parsed when the cvar text changes.
+const std::unordered_set<uint64_t>& CharacterVertexShaders() {
+  static std::string text;
+  static std::unordered_set<uint64_t> set;
+  const std::string& now = REXCVAR_GET(character_vs);
+  if (now != text) {
+    text = now;
+    set.clear();
+    size_t pos = 0;
+    while (pos < text.size()) {
+      size_t end = text.find(',', pos);
+      if (end == std::string::npos) end = text.size();
+      std::string item = text.substr(pos, end - pos);
+      item.erase(0, item.find_first_not_of(" 	"));
+      item.erase(item.find_last_not_of(" 	") + 1);
+      if (!item.empty()) set.insert(std::strtoull(item.c_str(), nullptr, 16));
+      pos = end + 1;
+    }
+  }
+  return set;
+}
+// log_frame_shaders: (vertex hash, pixel hash) -> (first draw index, draws,
+// draws flagged as characters, kSysFlag_DynamicMesh).
+struct FrameShaderUse {
+  uint32_t first = 0, draws = 0, dynamic = 0;
+};
 struct FrameShaderLog {
-  std::map<std::pair<uint64_t, uint64_t>, std::pair<uint32_t, uint32_t>> pairs;
+  std::map<std::pair<uint64_t, uint64_t>, FrameShaderUse> pairs;
   uint32_t draws = 0;
 };
 FrameShaderLog frame_shader_log;
@@ -2286,8 +2321,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
     REXGPU_INFO("[frame-shaders] frame {}: {} draws, {} shader pairs", frame_current_,
                 frame_shader_log.draws, order.size());
     for (const auto& [first, key] : order) {
-      REXGPU_INFO("[frame-shaders]   first {:5} draws {:4} vs {:016X} ps {:016X}", first,
-                  frame_shader_log.pairs[key].second, key.first, key.second);
+      const FrameShaderUse& use = frame_shader_log.pairs[key];
+      REXGPU_INFO("[frame-shaders]   first {:5} draws {:4} dyn {:4} vs {:016X} ps {:016X}", first,
+                  use.draws, use.dynamic, key.first, key.second);
     }
     frame_shader_log = {};
     REXCVAR_SET(log_frame_shaders, REXCVAR_GET(log_frame_shaders) - 1);
@@ -3877,6 +3913,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         }
       }
     }
+    const auto& character_vs_set = CharacterVertexShaders();
+    if (!character_vs_set.empty()) {
+      dynamic_mesh = character_vs_set.count(vertex_shader->ucode_data_hash()) != 0;
+    }
   }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
@@ -3951,8 +3991,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   if (REXCVAR_GET(log_frame_shaders) > 0) {
     auto key = std::make_pair(vertex_shader->ucode_data_hash(),
                               pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0));
-    auto it = frame_shader_log.pairs.try_emplace(key, frame_shader_log.draws, 0).first;
-    ++it->second.second;
+    auto it = frame_shader_log.pairs.try_emplace(key, FrameShaderUse{frame_shader_log.draws}).first;
+    ++it->second.draws;
+    if (dynamic_mesh) ++it->second.dynamic;
     ++frame_shader_log.draws;
   }
   if (REXCVAR_GET(log_frame_passes) > 0) {

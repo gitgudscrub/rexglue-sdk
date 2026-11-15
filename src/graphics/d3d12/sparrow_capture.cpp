@@ -161,16 +161,17 @@ void OnDraw(const RegisterFile& regs, memory::Memory& memory, const Shader& vert
     }
     j += "]}";
   }
-  // Textures read by the vertex shader (terrain heights, lookup tables): the
-  // tools need their data, which the texture dump doesn't always cover. Only the
-  // base level of 2D textures, as stored in guest memory (tiled or linear).
-  j += "],\"vtex\":[";
-  bool first_vtex = true;
-  for (const Shader::TextureBinding& binding : vertex_shader.texture_bindings()) {
-    xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+  // Raw guest memory of textures the tools can't get from the texture dump:
+  // everything the vertex shader reads (terrain heights, lookup tables) as
+  // "vtex", and pixel shader textures with no content hash (render-to-texture
+  // results such as the baked terrain colour; run with readback_resolve=full
+  // so they are in guest memory) as "ptex". Base level of 2D textures only, as
+  // stored (tiled or linear).
+  auto add_texture = [&](uint32_t fetch_constant, bool& first) {
+    xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(fetch_constant);
     const FormatInfo* format = FormatInfo::Get(uint32_t(fetch.format));
     if (fetch.type != xenos::FetchConstantType::kTexture || !format || !format->block_width) {
-      continue;
+      return;
     }
     uint32_t height = fetch.size_2d.height + 1;
     uint32_t block_rows = (height + format->block_height - 1) / format->block_height;
@@ -181,13 +182,30 @@ void OnDraw(const RegisterFile& regs, memory::Memory& memory, const Shader& vert
     uint32_t address = fetch.base_address << 12;
     uint32_t size = pitch_blocks * block_rows * format->bytes_per_block();
     if (!size || size > kMaxBufferBytes) {
-      continue;
+      return;
     }
     const uint8_t* data = memory.TranslatePhysical<const uint8_t*>(address);
-    j += fmt::format("{}{{\"fc\":{},\"addr\":{},\"size\":{},\"blob\":{}}}",
-                     first_vtex ? "" : ",", binding.fetch_constant, address, size,
-                     AddBuffer(data, address, size));
-    first_vtex = false;
+    j += fmt::format("{}{{\"fc\":{},\"addr\":{},\"size\":{},\"blob\":{}}}", first ? "" : ",",
+                     fetch_constant, address, size, AddBuffer(data, address, size));
+    first = false;
+  };
+  j += "],\"vtex\":[";
+  bool first_vtex = true;
+  for (const Shader::TextureBinding& binding : vertex_shader.texture_bindings()) {
+    add_texture(binding.fetch_constant, first_vtex);
+  }
+  j += "],\"ptex\":[";
+  bool first_ptex = true;
+  for (uint32_t i = 0; i < 32; ++i) {
+    if ((used_texture_mask & (uint32_t(1) << i)) && !texture_hashes[i]) {
+      bool in_vs = false;
+      for (const Shader::TextureBinding& binding : vertex_shader.texture_bindings()) {
+        in_vs |= binding.fetch_constant == i;
+      }
+      if (!in_vs) {
+        add_texture(i, first_ptex);
+      }
+    }
   }
   j += "],\"tex\":[";
   bool first_texture = true;

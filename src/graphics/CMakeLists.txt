@@ -81,6 +81,7 @@ if(REXGLUE_USE_D3D12)
         d3d12/command_processor.cpp
         d3d12/fable2_terrain_tess.cpp
         d3d12/fable2_skinning.cpp
+        d3d12/sparrow_capture.cpp
         d3d12/primitive_processor.cpp
         d3d12/render_target_cache.cpp
         d3d12/shader.cpp

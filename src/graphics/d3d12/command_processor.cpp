@@ -26,6 +26,7 @@
 #include <rex/graphics/d3d12/command_processor.h>
 #include "fable2_skinning.h"
 #include "fable2_terrain_tess.h"
+#include "sparrow_capture.h"
 #include <rex/graphics/d3d12/graphics_system.h>
 #include <rex/graphics/d3d12/shader.h>
 #include <rex/graphics/flags.h>
@@ -2242,6 +2243,7 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  sparrow_capture::OnSwap(frame_current_);
   if (REXCVAR_GET(log_frame_passes) > 0) {
     FlushFramePassRun();
     REXGPU_INFO("[frame-passes] swap {} ({} draws)", frame_current_, frame_pass_run.index);
@@ -3959,6 +3961,27 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     if (texture_sets_logged.insert(set_hash).second) {
       REXGPU_INFO("[texture-set] ps {:016X}{}", ps_hash, line);
     }
+  }
+  if (sparrow_capture::IsCapturing()) {
+    uint64_t texture_hashes[32] = {};
+    uint32_t textures_remaining = used_texture_mask;
+    uint32_t fetch_index;
+    while (rex::bit_scan_forward(textures_remaining, &fetch_index)) {
+      textures_remaining &= ~(uint32_t(1) << fetch_index);
+      texture_hashes[fetch_index] = texture_cache_->GetBoundTextureContentHash(fetch_index);
+    }
+    sparrow_capture::DrawIndexInfo index_info;
+    if (index_buffer_info) {
+      index_info.indexed = true;
+      index_info.format = index_buffer_info->format;
+      index_info.endianness = index_buffer_info->endianness;
+      index_info.guest_base = index_buffer_info->guest_base;
+      index_info.length = uint32_t(index_buffer_info->length);
+    }
+    sparrow_capture::OnDraw(regs, *memory_, *vertex_shader, pixel_shader, primitive_type,
+                            index_count, index_info, used_texture_mask, texture_hashes,
+                            texture_cache_->draw_resolution_scale_x(),
+                            texture_cache_->draw_resolution_scale_y());
   }
 
   // Bind the pipeline after configuring it and doing everything that may bind

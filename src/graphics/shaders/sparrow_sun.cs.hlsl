@@ -3,16 +3,19 @@
 // game's depth pre-pass and before its colour pass, on the post-grade root
 // signature: the map is t2 (kMean), the Sparrow texture u0 (kDestination).
 //
-// The Sparrow texture is R32_FLOAT, size x (size + 1):
+// The Sparrow texture is R32_FLOAT, size x (size + size / 8 + 1):
 //   rows 0 .. size-1  the map's depth (sample 0 when it is multisampled),
 //                     reversed: larger is nearer the sun, 0 = nothing;
-//   row size          frame data, one float per texel (SparrowFrame in
+//   rows size ..      the ground ambient grid, size / 8 rows
+//                     (sparrow_ambient.cs.hlsl writes them);
+//   last row          frame data, one float per texel (SparrowFrame in
 //                     shaders/sparrow_common.hlsli reads it):
 //                     0-2 map centre (world), 3 half width (negative: up
 //                     axis flipped), 4 half depth along the sun, 5 size,
 //                     6 valid (1), 7 bias in texels, 8-10 world direction
 //                     toward the sun, 11 frame counter (wraps at 2^24),
-//                     12 debug mode (sparrow_debug).
+//                     12 debug mode (sparrow_debug), 13 ambient grid
+//                     written this frame (1).
 // Materials bind it through the bindless table at a fixed index
 // (SystemBindlessView::kSparrowSun).
 
@@ -20,7 +23,7 @@ cbuffer SparrowSunConstants : register(b0) {
   uint size;
   uint frame;
   uint debug;
-  uint pad0;
+  uint grid;  // 1 when sparrow_ambient.cs.hlsl writes the grid this frame
   float4 centre_radius;  // xyz centre, w signed half width
   float4 depth_size;     // half depth, size, valid, bias texels
   float4 sun_dir;        // xyz toward the sun
@@ -61,6 +64,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     case 10: v = sun_dir.z; break;
     case 11: v = float(frame & 0xFFFFFFu); break;
     case 12: v = float(debug); break;
+    case 13: v = float(grid); break;
   }
-  sparrow_out[id.xy] = v;
+  sparrow_out[int2(id.x, size + size / 8u)] = v;
 }

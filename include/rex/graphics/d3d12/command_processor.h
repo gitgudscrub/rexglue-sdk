@@ -773,15 +773,18 @@ class D3D12CommandProcessor : public CommandProcessor {
   float sun_map_depth_ = 0.0f;
   float sun_map_dir_[3] = {};
 
-  // Project Sparrow: the sun map copied for the material shaders, with the
-  // frame data in an extra row (sparrow_sun.cs.hlsl), bound at
-  // SystemBindlessView::kSparrowSun. Kept in a shader-readable state.
-  // Creates sparrow_sun_ (size x size+1) and points the bindless slot at it.
+  // Project Sparrow: the sun map copied for the material shaders, then the
+  // ground ambient grid (size/8 rows, sparrow_ambient.cs.hlsl) and the frame
+  // data row (sparrow_sun.cs.hlsl), bound at SystemBindlessView::kSparrowSun.
+  // Kept in a shader-readable state. Creates sparrow_sun_
+  // (size x size+size/8+1) and points the bindless slot at it.
   bool EnsureSparrowSun(uint32_t size);
   Microsoft::WRL::ComPtr<ID3D12Resource> sparrow_sun_;
   uint32_t sparrow_sun_size_ = 0;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_sun_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_sun_ms_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_ambient_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_ambient_ms_pipeline_;
   bool sparrow_logged_ = false;
 
   // Vertex buffers seen in draws, by guest address: when one is seen with

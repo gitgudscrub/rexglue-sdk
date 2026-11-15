@@ -383,6 +383,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/post_ao_ao_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/sparrow_sun_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/sparrow_sun_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_ambient_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_ambient_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_h_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_v_cs.h"
 }  // namespace shaders
@@ -3038,6 +3040,8 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   REX_POST_GRADE_PIPELINE(post_ao_blur_v_pipeline_, post_ao_blur_v_cs)
   REX_POST_GRADE_PIPELINE(sparrow_sun_pipeline_, sparrow_sun_cs)
   REX_POST_GRADE_PIPELINE(sparrow_sun_ms_pipeline_, sparrow_sun_ms_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_ambient_pipeline_, sparrow_ambient_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_ambient_ms_pipeline_, sparrow_ambient_ms_cs)
 #undef REX_POST_GRADE_PIPELINE
   return true;
 }
@@ -3424,6 +3428,7 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
       sc.depth_size[3] = float(REXCVAR_GET(post_sun_map_bias));
     }
     sc.depth_size[1] = float(sparrow_sun_size_);
+    sc.pad0[1] = (sun_map && sparrow_ambient_pipeline_) ? 1u : 0u;
     deferred_command_list_.D3DSetComputeRoot32BitConstants(
         UINT(PostGradeRootParameter::kConstants), sizeof(sc) / sizeof(uint32_t), &sc, 0);
     table(PostGradeRootParameter::kMean, sun_map ? d[6] : d[8]);
@@ -3436,11 +3441,19 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
     SubmitBarriers();
     deferred_command_list_.D3DDispatch((sparrow_sun_size_ + 7) / 8,
                                        (sparrow_sun_size_ + 1 + 7) / 8, 1);
+    if (sc.pad0[1]) {
+      // The ground ambient grid (sparrow_ambient.cs.hlsl): reads the map, not
+      // the copy, and writes other texels, so no barrier between the two.
+      uint32_t grid = sparrow_sun_size_ / 8;
+      SetExternalPipeline(sun_map_samples_ > 1 ? sparrow_ambient_ms_pipeline_.Get()
+                                               : sparrow_ambient_pipeline_.Get());
+      deferred_command_list_.D3DDispatch((grid + 7) / 8, (grid + 7) / 8, 1);
+    }
     PushTransitionBarrier(sparrow_sun_.Get(), kWrite, kShaderRead);
     if (!sparrow_logged_) {
       sparrow_logged_ = true;
       REXGPU_INFO("Sparrow: sun texture {}x{} at bindless slot {}, map {}", sparrow_sun_size_,
-                  sparrow_sun_size_ + 1,
+                  sparrow_sun_size_ + sparrow_sun_size_ / 8 + 1,
                   uint32_t(SystemBindlessView::kSparrowSun) -
                       uint32_t(SystemBindlessView::kUnboundedSRVsStart),
                   sun_map ? "on" : "off");
@@ -3467,7 +3480,7 @@ bool D3D12CommandProcessor::EnsureSparrowSun(uint32_t size) {
   D3D12_RESOURCE_DESC desc = {};
   desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
   desc.Width = size;
-  desc.Height = size + 1;
+  desc.Height = size + size / 8 + 1;
   desc.DepthOrArraySize = 1;
   desc.MipLevels = 1;
   desc.Format = DXGI_FORMAT_R32_FLOAT;

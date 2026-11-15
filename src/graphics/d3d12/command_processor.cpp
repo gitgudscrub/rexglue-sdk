@@ -228,6 +228,15 @@ REXCVAR_DEFINE_DOUBLE(post_ao_world_fade, 500.0, "GPU/D3D12",
                       "World AO: view distance in world units where it has faded out")
     .range(1.0, 100000.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(sparrow_renderer, false, "GPU/D3D12",
+                    "Project Sparrow: hand the sun shadow map and frame data to the material "
+                    "shaders (bindless slot 3) each frame; needs post_sun_map and post_ao")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
+                     "Project Sparrow debug: 1 = the material shaders drop the sun wherever "
+                     "the Sparrow shadow map covers (shows what they reach)")
+    .range(0, 1)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
                     "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "
                     "depth pre-pass is drawn a second time from the sun, so rocks, walls, "
@@ -371,6 +380,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/post_grade_haze_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_ao_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_ao_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_sun_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_sun_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_h_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_v_cs.h"
 }  // namespace shaders
@@ -1860,6 +1871,19 @@ bool D3D12CommandProcessor::SetupContext() {
         nullptr, &null_srv_desc,
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kNullTextureCube)));
+    // kSparrowSun: null until EnsureSparrowSun (reads 0 = not valid).
+    null_srv_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    null_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+    null_srv_desc.Texture2DArray.MostDetailedMip = 0;
+    null_srv_desc.Texture2DArray.MipLevels = 1;
+    null_srv_desc.Texture2DArray.FirstArraySlice = 0;
+    null_srv_desc.Texture2DArray.ArraySize = 1;
+    null_srv_desc.Texture2DArray.PlaneSlice = 0;
+    null_srv_desc.Texture2DArray.ResourceMinLODClamp = 0.0f;
+    device->CreateShaderResourceView(
+        nullptr, &null_srv_desc,
+        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                      uint32_t(SystemBindlessView::kSparrowSun)));
     // kSharedMemoryRawSRV.
     shared_memory_->WriteRawSRVDescriptor(provider.OffsetViewDescriptor(
         view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kSharedMemoryRawSRV)));
@@ -3011,6 +3035,8 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   REX_POST_GRADE_PIPELINE(post_ao_ms_pipeline_, post_ao_ao_ms_cs)
   REX_POST_GRADE_PIPELINE(post_ao_blur_h_pipeline_, post_ao_blur_h_cs)
   REX_POST_GRADE_PIPELINE(post_ao_blur_v_pipeline_, post_ao_blur_v_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_sun_pipeline_, sparrow_sun_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_sun_ms_pipeline_, sparrow_sun_ms_cs)
 #undef REX_POST_GRADE_PIPELINE
   return true;
 }
@@ -3173,8 +3199,12 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
                  frame_current_ < sun_map_frame_ +
                                       uint64_t(std::max(1, REXCVAR_GET(post_sun_map_interval))) &&
                  sun_map_draws_ > 0;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair d[7];
-  if (!RequestOneUseSingleViewDescriptors(sun_map ? 7 : 6, d)) {
+  // d7 Sparrow sun texture UAV, d8 null map SRV (sparrow_renderer).
+  bool sparrow = REXCVAR_GET(sparrow_renderer) && bindless_resources_used_ &&
+                 sparrow_sun_pipeline_ &&
+                 EnsureSparrowSun(sun_map ? sun_map_size_ : std::max(sparrow_sun_size_, 256u));
+  ui::d3d12::util::DescriptorCpuGpuHandlePair d[9];
+  if (!RequestOneUseSingleViewDescriptors(sparrow ? 9 : (sun_map ? 7 : 6), d)) {
     return;
   }
   if (sun_map) {
@@ -3261,6 +3291,11 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
       }
       constants.sun_enabled =
           REXCVAR_GET(post_sun_shadows) ? 1 + uint32_t(REXCVAR_GET(post_sun_debug)) : 0;
+      if (sparrow && sun_map && !REXCVAR_GET(post_sun_debug)) {
+        // Sparrow shades the sun term inside the material shaders from the
+        // same map; darkening here as well would shadow those twice.
+        constants.sun_enabled = 0;
+      }
       constants.sun_strength = float(REXCVAR_GET(post_sun_strength));
       constants.sun_length = float(REXCVAR_GET(post_sun_length));
       constants.sun_thickness = float(REXCVAR_GET(post_sun_thickness));
@@ -3352,11 +3387,113 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
   table(PostGradeRootParameter::kDestination, d[5]);
   pass(post_ao_blur_v_pipeline_.Get(), ao0);
   post_ao_frame_ = frame_current_;
+  if (sparrow) {
+    // Project Sparrow (sparrow_sun.cs.hlsl): copy the map and write the frame
+    // row; with no map this frame, a null map and valid = 0, so the material
+    // shaders fall back to the game's own shadow.
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav_desc = {};
+    uav_desc.Format = DXGI_FORMAT_R32_FLOAT;
+    uav_desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    device->CreateUnorderedAccessView(sparrow_sun_.Get(), nullptr, &uav_desc, d[7].first);
+    if (!sun_map) {
+      D3D12_SHADER_RESOURCE_VIEW_DESC null_desc = {};
+      null_desc.Format = DXGI_FORMAT_R32_FLOAT;
+      null_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+      null_desc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+      null_desc.Texture2D.MipLevels = 1;
+      device->CreateShaderResourceView(nullptr, &null_desc, d[8].first);
+    }
+    struct {
+      uint32_t size, frame, pad0[2];
+      float centre_radius[4], depth_size[4], sun_dir[4];
+      uint32_t pad1[36];
+    } sc = {};
+    static_assert(sizeof(sc) == sizeof(PostGradeConstants));
+    sc.size = sparrow_sun_size_;
+    sc.frame = uint32_t(frame_current_);
+    sc.pad0[0] = uint32_t(REXCVAR_GET(sparrow_debug));
+    if (sun_map) {
+      for (uint32_t i = 0; i < 3; ++i) {
+        sc.centre_radius[i] = sun_map_center_[i];
+        sc.sun_dir[i] = sun_map_dir_[i];
+      }
+      sc.centre_radius[3] = sun_map_radius_;
+      sc.depth_size[0] = sun_map_depth_;
+      sc.depth_size[2] = 1.0f;
+      sc.depth_size[3] = float(REXCVAR_GET(post_sun_map_bias));
+    }
+    sc.depth_size[1] = float(sparrow_sun_size_);
+    deferred_command_list_.D3DSetComputeRoot32BitConstants(
+        UINT(PostGradeRootParameter::kConstants), sizeof(sc) / sizeof(uint32_t), &sc, 0);
+    table(PostGradeRootParameter::kMean, sun_map ? d[6] : d[8]);
+    table(PostGradeRootParameter::kDestination, d[7]);
+    const D3D12_RESOURCE_STATES kShaderRead =
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    PushTransitionBarrier(sparrow_sun_.Get(), kShaderRead, kWrite);
+    SetExternalPipeline(sun_map && sun_map_samples_ > 1 ? sparrow_sun_ms_pipeline_.Get()
+                                                        : sparrow_sun_pipeline_.Get());
+    SubmitBarriers();
+    deferred_command_list_.D3DDispatch((sparrow_sun_size_ + 7) / 8,
+                                       (sparrow_sun_size_ + 1 + 7) / 8, 1);
+    PushTransitionBarrier(sparrow_sun_.Get(), kWrite, kShaderRead);
+    if (!sparrow_logged_) {
+      sparrow_logged_ = true;
+      REXGPU_INFO("Sparrow: sun texture {}x{} at bindless slot {}, map {}", sparrow_sun_size_,
+                  sparrow_sun_size_ + 1,
+                  uint32_t(SystemBindlessView::kSparrowSun) -
+                      uint32_t(SystemBindlessView::kUnboundedSRVsStart),
+                  sun_map ? "on" : "off");
+    }
+  }
   if (sun_map) {
     PushTransitionBarrier(sun_map_.Get(), D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                           D3D12_RESOURCE_STATE_DEPTH_WRITE);
     sun_map_srv_state_ = false;
   }
+}
+
+bool D3D12CommandProcessor::EnsureSparrowSun(uint32_t size) {
+  if (sparrow_sun_ && sparrow_sun_size_ == size) {
+    return true;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (sparrow_sun_) {
+    sparrow_sun_->AddRef();
+    resources_for_deletion_.emplace_back(submission_current_, sparrow_sun_.Get());
+    sparrow_sun_.Reset();
+  }
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = size;
+  desc.Height = size + 1;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R32_FLOAT;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  // Zeroed, so the frame row reads "not valid" until the first copy.
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+          nullptr, IID_PPV_ARGS(&sparrow_sun_)))) {
+    REXGPU_ERROR("Sparrow: failed to create the sun texture");
+    sparrow_sun_size_ = 0;
+    return false;
+  }
+  sparrow_sun_size_ = size;
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32_FLOAT;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2DArray.MipLevels = 1;
+  srv.Texture2DArray.ArraySize = 1;
+  device->CreateShaderResourceView(
+      sparrow_sun_.Get(), &srv,
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kSparrowSun)));
+  return true;
 }
 
 // Sun shadow map: once a frame, at the first depth pre-pass draw, place a

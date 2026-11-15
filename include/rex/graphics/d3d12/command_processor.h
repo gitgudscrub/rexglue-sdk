@@ -163,6 +163,10 @@ class D3D12CommandProcessor : public CommandProcessor {
     kNullTexture2DArray = kUnboundedSRVsStart,
     kNullTexture3D,
     kNullTextureCube,
+    // Project Sparrow (sparrow_renderer): the sun shadow map plus a row of
+    // frame data, R32_FLOAT as a 2D array. Shader index 3 in the unbounded
+    // table (shaders/sparrow_common.hlsli: SPARROW_SUN_INDEX).
+    kSparrowSun,
 
     kCount,
   };
@@ -768,6 +772,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   float sun_map_radius_ = 0.0f;
   float sun_map_depth_ = 0.0f;
   float sun_map_dir_[3] = {};
+
+  // Project Sparrow: the sun map copied for the material shaders, with the
+  // frame data in an extra row (sparrow_sun.cs.hlsl), bound at
+  // SystemBindlessView::kSparrowSun. Kept in a shader-readable state.
+  // Creates sparrow_sun_ (size x size+1) and points the bindless slot at it.
+  bool EnsureSparrowSun(uint32_t size);
+  Microsoft::WRL::ComPtr<ID3D12Resource> sparrow_sun_;
+  uint32_t sparrow_sun_size_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_sun_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_sun_ms_pipeline_;
+  bool sparrow_logged_ = false;
 
   // Vertex buffers seen in draws, by guest address: when one is seen with
   // pages the CPU wrote since its last upload, it is dynamic (a skinned

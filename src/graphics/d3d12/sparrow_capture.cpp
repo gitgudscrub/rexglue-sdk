@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 
 #include <rex/cvar.h>
+#include <rex/graphics/pipeline/texture/info.h>
 #include <rex/logging.h>
 
 REXCVAR_DEFINE_INT32(sparrow_capture, 0, "GPU/D3D12",
@@ -159,6 +160,34 @@ void OnDraw(const RegisterFile& regs, memory::Memory& memory, const Shader& vert
       first_attr = false;
     }
     j += "]}";
+  }
+  // Textures read by the vertex shader (terrain heights, lookup tables): the
+  // tools need their data, which the texture dump doesn't always cover. Only the
+  // base level of 2D textures, as stored in guest memory (tiled or linear).
+  j += "],\"vtex\":[";
+  bool first_vtex = true;
+  for (const Shader::TextureBinding& binding : vertex_shader.texture_bindings()) {
+    xenos::xe_gpu_texture_fetch_t fetch = regs.GetTextureFetch(binding.fetch_constant);
+    const FormatInfo* format = FormatInfo::Get(uint32_t(fetch.format));
+    if (fetch.type != xenos::FetchConstantType::kTexture || !format || !format->block_width) {
+      continue;
+    }
+    uint32_t height = fetch.size_2d.height + 1;
+    uint32_t block_rows = (height + format->block_height - 1) / format->block_height;
+    if (fetch.tiled) {
+      block_rows = (block_rows + 31) & ~uint32_t(31);
+    }
+    uint32_t pitch_blocks = (fetch.pitch << 5) / format->block_width;
+    uint32_t address = fetch.base_address << 12;
+    uint32_t size = pitch_blocks * block_rows * format->bytes_per_block();
+    if (!size || size > kMaxBufferBytes) {
+      continue;
+    }
+    const uint8_t* data = memory.TranslatePhysical<const uint8_t*>(address);
+    j += fmt::format("{}{{\"fc\":{},\"addr\":{},\"size\":{},\"blob\":{}}}",
+                     first_vtex ? "" : ",", binding.fetch_constant, address, size,
+                     AddBuffer(data, address, size));
+    first_vtex = false;
   }
   j += "],\"tex\":[";
   bool first_texture = true;

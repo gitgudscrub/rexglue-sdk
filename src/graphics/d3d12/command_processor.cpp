@@ -234,8 +234,9 @@ REXCVAR_DEFINE_BOOL(sparrow_renderer, false, "GPU/D3D12",
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
                      "Project Sparrow debug: 1 = the material shaders drop the sun wherever "
-                     "the Sparrow shadow map covers (shows what they reach)")
-    .range(0, 1)
+                     "the Sparrow shadow map covers (shows what they reach); 2 = show only "
+                     "the light Sparrow's materials add (specular, sky reflection)")
+    .range(0, 3)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
                     "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "

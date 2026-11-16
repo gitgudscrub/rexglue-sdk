@@ -28,6 +28,9 @@ struct DeviceInfo {
   std::string name;
   std::string guid;
   bool synthetic = false;  // keyboard/mouse emulation or the NOP stand-in
+  // Synthetic devices only: route to this guest user instead of user 0
+  // (-1 = default). Lets a host-driven pad act as player 2-4.
+  int32_t fixed_user = -1;
 };
 
 }  // namespace rex::input

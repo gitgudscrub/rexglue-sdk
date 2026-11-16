@@ -19,6 +19,7 @@
 #include <rex/logging.h>
 #include <rex/hook.h>
 #include <rex/types.h>
+#include <rex/cvar.h>
 #include <rex/runtime.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xtypes.h>
@@ -39,6 +40,10 @@ using rex::input::X_INPUT_VIBRATION;
 
 constexpr uint32_t XINPUT_FLAG_GAMEPAD = 0x01;
 constexpr uint32_t XINPUT_FLAG_ANY_USER = 1 << 30;
+
+REXCVAR_DEFINE_BOOL(primary_slot_remap, true, "Input",
+                    "Front-end fix: a button press on any pad makes that pad player 1. "
+                    "Turn off for co-op (players 2-4 must keep their own slots).");
 
 namespace {
 
@@ -83,7 +88,7 @@ bool primary_slot_remap_enabled() {
 // Maps a guest user index to the host XInput slot to query/report.
 uint32_t host_slot_for_guest(u32 user_index) {
   auto& r = primary_slot_remap();
-  if (user_index >= 4) {
+  if (user_index >= 4 || !REXCVAR_GET(primary_slot_remap)) {
     return user_index;
   }
   std::lock_guard<std::mutex> l(r.lock);
@@ -102,6 +107,12 @@ bool note_guest_button_press(u32 user_index, u32 host_slot, u16 buttons) {
   }
   auto& r = primary_slot_remap();
   std::lock_guard<std::mutex> l(r.lock);
+  if (!REXCVAR_GET(primary_slot_remap)) {
+    // Off (co-op): put every user back on its own slot.
+    for (uint32_t i = 0; i < 4; ++i) r.map[i] = i;
+    r.last_buttons[host_slot] = buttons;
+    return false;
+  }
   const bool press_edge = (buttons & ~r.last_buttons[host_slot]) != 0;
   r.last_buttons[host_slot] = buttons;
   if (!press_edge || user_index == 0) {

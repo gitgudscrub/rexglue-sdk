@@ -274,6 +274,11 @@ class DxbcShaderTranslator : public ShaderTranslator {
     // while scenery buffers never change). Not used by the translator; read
     // by the hand-written shader replacements.
     kSysFlag_DynamicMesh = 1u << 31,
+    // Fable II fork, Project Sparrow: character material id (0 cloth,
+    // 1 leather, 2 metal, 3 gloss) from the character_materials table, on
+    // draws with kSysFlag_DynamicMesh only.
+    kSysFlag_CharacterMaterial_Shift = 29,
+    kSysFlag_CharacterMaterial_Mask = 3u << 29,
   };
   static_assert(kSysFlag_Count <= 32, "Too many flags in the system constants");
 

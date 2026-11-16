@@ -42,6 +42,7 @@
 REXCVAR_DECLARE(std::string, texture_pack_root);
 REXCVAR_DECLARE(bool, texture_dump);
 REXCVAR_DECLARE(bool, texture_replacement);
+REXCVAR_DECLARE(std::string, character_materials);
 
 namespace rex::graphics::texture_replacement {
 
@@ -95,10 +96,11 @@ class TextureReplacer {
   void Initialize();
   void Shutdown();
 
-  // Whether hashing loaded textures is useful at all (dumping on, or a pack
-  // with at least one replacement).
+  // Whether hashing loaded textures is useful at all (dumping on, a pack
+  // with at least one replacement, or a character material table).
   bool IsActive() const {
-    return dump_enabled_ || !replacements_.empty() || !highlights_.empty();
+    return dump_enabled_ || !replacements_.empty() || !highlights_.empty() ||
+           !materials_.empty();
   }
   bool dump_enabled() const { return dump_enabled_; }
 
@@ -129,6 +131,19 @@ class TextureReplacer {
   // Whether the hash is in the texture_highlight list (see the cvar).
   bool IsHighlighted(uint64_t hash) const;
 
+  // Fable II fork, Project Sparrow: character material table (the
+  // character_materials cvar names a text file of "<hash> <material>" lines).
+  // Re-reads the file when the cvar or the file's write time changes; call
+  // once per frame or so. Independent of the pack (works without a root).
+  void UpdateMaterials();
+  // Material id of a texture: 0 = not listed (default cloth), 1 = leather,
+  // 2 = metal, 3 = gloss.
+  uint32_t MaterialOf(uint64_t hash) const {
+    auto it = materials_.find(hash);
+    return it != materials_.end() ? it->second : 0;
+  }
+  bool HasMaterials() const { return !materials_.empty(); }
+
  private:
   struct DumpJob;
   class DumpWorker;
@@ -140,6 +155,11 @@ class TextureReplacer {
   std::unordered_set<uint64_t> dumped_;
   // texture_highlight: upper-case hex hash prefixes.
   std::vector<std::string> highlights_;
+  // character_materials: hash -> material id, and what was loaded.
+  std::unordered_map<uint64_t, uint32_t> materials_;
+  std::string materials_path_;
+  std::filesystem::file_time_type materials_time_{};
+  uint64_t materials_check_ms_ = 0;
 
   // Last Hash() input, untiled.
   GuestTexture last_texture_{};

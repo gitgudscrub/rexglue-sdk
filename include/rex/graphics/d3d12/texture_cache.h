@@ -106,6 +106,9 @@ class D3D12TextureCache final : public TextureCache {
   // Texture pack content hash (as in the dump file names) of the texture
   // bound at a fetch constant, or 0 if none / not hashed. For diagnostics.
   uint64_t GetBoundTextureContentHash(uint32_t fetch_constant_index) const;
+  // Project Sparrow: the character material (character_materials cvar) of the
+  // first bound texture in the mask that the table lists, 0 if none.
+  uint32_t GetBoundTextureMaterial(uint32_t used_texture_mask) const;
 
   // Returns whether texture SRV keys stored externally are still valid for the
   // current bindings and host shader binding layout. Both keys and

@@ -15,6 +15,7 @@
 #include <system_error>
 #include <thread>
 
+#include <rex/chrono/clock.h>
 #include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -44,6 +45,12 @@ REXCVAR_DEFINE_STRING(texture_highlight, "", "GPU",
                       "digits, as in the dump file names) to show as solid colours (magenta, red, "
                       "green, blue, yellow, cyan, white, orange in list order) so the surfaces "
                       "using them can be found");
+REXCVAR_DEFINE_STRING(character_materials, "", "GPU",
+                      "Project Sparrow: text file of character texture materials, one "
+                      "\"<hash> <leather|metal|gloss>\" per line (# starts a comment). Character "
+                      "draws using a listed texture get the material in system flag bits 29-30 "
+                      "for the shader replacements. Re-read when the file changes. Empty: off")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 namespace rex::graphics::texture_replacement {
 
@@ -826,6 +833,55 @@ void TextureReplacer::Initialize() {
                   rex::path_to_utf8(dump_dir_));
     }
   }
+}
+
+void TextureReplacer::UpdateMaterials() {
+  // Called per draw: look at the cvar and the file at most once a second.
+  uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
+  if (materials_check_ms_ && now - materials_check_ms_ < 1000) {
+    return;
+  }
+  materials_check_ms_ = now;
+  const std::string& path_utf8 = REXCVAR_GET(character_materials);
+  std::filesystem::path path = std::filesystem::u8path(path_utf8);
+  std::error_code ec;
+  std::filesystem::file_time_type time{};
+  if (!path_utf8.empty()) {
+    time = std::filesystem::last_write_time(path, ec);
+    if (ec) time = {};
+  }
+  if (path_utf8 == materials_path_ && time == materials_time_) {
+    return;
+  }
+  materials_path_ = path_utf8;
+  materials_time_ = time;
+  materials_.clear();
+  if (path_utf8.empty()) {
+    return;
+  }
+  std::ifstream file(path);
+  if (!file) {
+    REXGPU_WARN("Character materials: can't read {}", path_utf8);
+    return;
+  }
+  uint32_t counts[4] = {};
+  std::string line;
+  while (std::getline(file, line)) {
+    size_t hash_pos = line.find('#');
+    if (hash_pos != std::string::npos) line.resize(hash_pos);
+    char hex[32] = {}, name[32] = {};
+    if (std::sscanf(line.c_str(), "%31s %31s", hex, name) != 2) continue;
+    uint64_t hash;
+    if (!ParseHashPrefix(hex, hash)) continue;
+    std::string material = name;
+    for (char& c : material) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    uint32_t id = material == "leather" ? 1 : material == "metal" ? 2 : material == "gloss" ? 3 : 0;
+    if (!id) continue;
+    materials_[hash] = id;
+    ++counts[id];
+  }
+  REXGPU_INFO("Character materials: {} leather, {} metal, {} gloss from {}", counts[1], counts[2],
+              counts[3], path_utf8);
 }
 
 void TextureReplacer::Shutdown() {

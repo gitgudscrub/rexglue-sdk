@@ -380,7 +380,8 @@ class D3D12CommandProcessor : public CommandProcessor {
                                   const draw_util::ViewportInfo& viewport_info,
                                   uint32_t used_texture_mask,
                                   reg::RB_DEPTHCONTROL normalized_depth_control,
-                                  uint32_t normalized_color_mask, bool dynamic_mesh);
+                                  uint32_t normalized_color_mask, bool dynamic_mesh,
+                                  uint32_t character_material);
   bool UpdateBindings(const D3D12Shader* vertex_shader, const D3D12Shader* pixel_shader,
                       ID3D12RootSignature* root_signature, bool shared_memory_is_uav);
   bool IssueCopy_ReadbackResolvePath();

@@ -294,8 +294,10 @@ REXCVAR_DEFINE_BOOL(sparrow_renderer, false, "GPU/D3D12",
 REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
                      "Project Sparrow debug: 1 = the material shaders drop the sun wherever "
                      "the Sparrow shadow map covers (shows what they reach); 2 = show only "
-                     "the light Sparrow's materials add (specular, sky reflection)")
-    .range(0, 3)
+                     "the light Sparrow's materials add (specular, sky reflection); 3 = sky "
+                     "visibility; 4 = character materials as colours (grey cloth, brown "
+                     "leather, cyan metal, magenta gloss)")
+    .range(0, 4)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
                     "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "
@@ -4181,6 +4183,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vertex_shader->GetUsedTextureMaskAfterTranslation() |
       (pixel_shader != nullptr ? pixel_shader->GetUsedTextureMaskAfterTranslation() : 0);
   texture_cache_->RequestTextures(used_texture_mask);
+  // Project Sparrow: material of a character draw, from its pixel shader's
+  // textures (character_materials table).
+  uint32_t character_material =
+      dynamic_mesh && pixel_shader
+          ? texture_cache_->GetBoundTextureMaterial(
+                pixel_shader->GetUsedTextureMaskAfterTranslation())
+          : 0;
   if (REXCVAR_GET(log_frame_textures) > 0) {
     uint64_t ps_hash = pixel_shader ? pixel_shader->ucode_data_hash() : uint64_t(0);
     uint32_t textures_remaining = used_texture_mask;
@@ -4206,8 +4215,13 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       set_hash = (set_hash ^ (tex_hash + fetch_index)) * 0x100000001B3ull;
       line += fmt::format(" {}={:016X}", fetch_index, tex_hash);
     }
+    if (dynamic_mesh) {
+      set_hash ^= 0xC4A2ull;
+    }
     if (texture_sets_logged.insert(set_hash).second) {
-      REXGPU_INFO("[texture-set] ps {:016X}{}", ps_hash, line);
+      // " char": a character draw (kSysFlag_DynamicMesh); mN: its material.
+      REXGPU_INFO("[texture-set] ps {:016X}{}{}", ps_hash, line,
+                  dynamic_mesh ? fmt::format(" char m{}", character_material) : std::string());
     }
   }
   if (sparrow_capture::IsCapturing()) {
@@ -4291,7 +4305,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                              primitive_processing_result.line_loop_closing_index,
                              primitive_processing_result.host_shader_index_endian, viewport_info,
                              used_texture_mask, normalized_depth_control, normalized_color_mask,
-                             dynamic_mesh);
+                             dynamic_mesh, character_material);
 
   // Update constant buffers, descriptors and root parameters.
   if (!UpdateBindings(vertex_shader, pixel_shader, root_signature, memexport_used)) {
@@ -5549,7 +5563,7 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
     bool shared_memory_is_uav, bool primitive_polygonal, uint32_t line_loop_closing_index,
     xenos::Endian index_endian, const draw_util::ViewportInfo& viewport_info,
     uint32_t used_texture_mask, reg::RB_DEPTHCONTROL normalized_depth_control,
-    uint32_t normalized_color_mask, bool dynamic_mesh) {
+    uint32_t normalized_color_mask, bool dynamic_mesh, uint32_t character_material) {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
@@ -5652,6 +5666,8 @@ void D3D12CommandProcessor::UpdateSystemConstantValues(
   }
   if (dynamic_mesh) {
     flags |= DxbcShaderTranslator::kSysFlag_DynamicMesh;
+    flags |= (character_material << DxbcShaderTranslator::kSysFlag_CharacterMaterial_Shift) &
+             DxbcShaderTranslator::kSysFlag_CharacterMaterial_Mask;
   }
   // Alpha test.
   xenos::CompareFunction alpha_test_function = rb_colorcontrol.alpha_test_enable

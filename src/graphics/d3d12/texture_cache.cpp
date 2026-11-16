@@ -731,6 +731,7 @@ void D3D12TextureCache::RequestTextures(uint32_t used_texture_mask) {
     texture_replacer_.Initialize();
     replacement_shown_ = REXCVAR_GET(texture_replacement);
   }
+  texture_replacer_.UpdateMaterials();
 
   // Toggling texture pack replacements: rebuild the bindings so the
   // descriptors are chosen again (descriptor indices are part of the SRV keys,
@@ -2324,6 +2325,23 @@ uint64_t D3D12TextureCache::GetBoundTextureContentHash(uint32_t fetch_constant_i
   }
   const D3D12Texture& texture = *static_cast<const D3D12Texture*>(binding->texture);
   return texture.replacement_.content_hash_valid ? texture.replacement_.content_hash : 0;
+}
+
+uint32_t D3D12TextureCache::GetBoundTextureMaterial(uint32_t used_texture_mask) const {
+  if (!texture_replacer_.HasMaterials()) {
+    return 0;
+  }
+  uint32_t fetch_index;
+  while (rex::bit_scan_forward(used_texture_mask, &fetch_index)) {
+    used_texture_mask &= ~(uint32_t(1) << fetch_index);
+    uint64_t hash = GetBoundTextureContentHash(fetch_index);
+    if (hash) {
+      if (uint32_t material = texture_replacer_.MaterialOf(hash)) {
+        return material;
+      }
+    }
+  }
+  return 0;
 }
 
 void D3D12TextureCache::UpdateTextureReplacement(D3D12Texture& texture) {

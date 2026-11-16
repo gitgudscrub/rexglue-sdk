@@ -82,6 +82,10 @@ class PipelineCache {
 
   // If draw_util::IsRasterizationPotentiallyDone is false, the pixel shader
   // MUST be made nullptr BEFORE calling this!
+  // Whether shader_replace_dir has a replacement for this ucode hash (any
+  // resolution scale variant). Cached per hash; safe from any thread.
+  static bool HasShaderReplacement(uint64_t ucode_hash);
+
   bool ConfigurePipeline(D3D12Shader::D3D12Translation* vertex_shader,
                          D3D12Shader::D3D12Translation* pixel_shader,
                          const PrimitiveProcessor::ProcessingResult& primitive_processing_result,

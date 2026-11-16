@@ -182,6 +182,9 @@ class DxbcShaderTranslator : public ShaderTranslator {
       uint32_t dynamic_addressable_register_count : 8;
       // Non-ROV - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 2;
+    // Fable 2: skip shader_replace_dir for this translation (sparrow_split
+    // draws the game's own shader on one side of the split).
+    uint32_t sparrow_original : 1;
     } pixel;
 
     explicit Modification(uint64_t modification_value = 0) : value(modification_value) {

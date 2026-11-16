@@ -27,6 +27,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -1114,6 +1115,33 @@ bool PipelineCache::ConfigurePipeline(
   return true;
 }
 
+bool PipelineCache::HasShaderReplacement(uint64_t ucode_hash) {
+  static std::mutex mutex;
+  static std::unordered_map<uint64_t, bool> found;
+  std::lock_guard<std::mutex> lock(mutex);
+  auto it = found.find(ucode_hash);
+  if (it != found.end()) {
+    return it->second;
+  }
+  bool has = false;
+  const std::string& replace_dir = REXCVAR_GET(shader_replace_dir);
+  if (!replace_dir.empty()) {
+    char hash_text[17];
+    std::snprintf(hash_text, sizeof(hash_text), "%016llX",
+                  static_cast<unsigned long long>(ucode_hash));
+    std::filesystem::path dir(replace_dir);
+    std::error_code ec;
+    for (const char* suffix : {".dxbc", ".x1.dxbc", ".x2.dxbc", ".x3.dxbc"}) {
+      if (std::filesystem::is_regular_file(dir / (std::string(hash_text) + suffix), ec)) {
+        has = true;
+        break;
+      }
+    }
+  }
+  found.emplace(ucode_hash, has);
+  return has;
+}
+
 // shader_highlight / shader_replace_dir (see the cvars).
 void PipelineCache::ApplyShaderOverrides(D3D12Shader::D3D12Translation& translation,
                                          uint32_t resolution_scale) {
@@ -1121,6 +1149,10 @@ void PipelineCache::ApplyShaderOverrides(D3D12Shader::D3D12Translation& translat
   char hash_text[17];
   std::snprintf(hash_text, sizeof(hash_text), "%016llX",
                 static_cast<unsigned long long>(shader.ucode_data_hash()));
+  if (shader.type() == xenos::ShaderType::kPixel &&
+      DxbcShaderTranslator::Modification(translation.modification()).pixel.sparrow_original) {
+    return;  // sparrow_split: the game's own translation, untouched.
+  }
   const std::string& replace_dir = REXCVAR_GET(shader_replace_dir);
   static std::atomic<bool> logged_dir{false};
   if (!logged_dir.exchange(true)) {

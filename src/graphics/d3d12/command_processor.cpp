@@ -91,7 +91,41 @@ REXCVAR_DEFINE_STRING(character_vs, "D4D558DA6A82BDC8,A1F7E9885EC466DF,79EAC4958
                       "characters (kSysFlag_DynamicMesh). Empty: guess from vertex buffers the "
                       "CPU rewrote")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(sparrow_split, 0.0, "GPU/D3D12",
+                      "Diagnostic A/B: draws whose pixel shader has a shader_replace_dir "
+                      "replacement show the game's own shader left of this fraction of the "
+                      "viewport and the replacement right of it, in the same frame. 0 = off")
+    .range(0.0, 1.0)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(sparrow_split_shaders, "", "GPU/D3D12",
+                      "Comma-separated pixel shader hashes sparrow_split applies to. Empty: "
+                      "every replaced shader")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 namespace {
+void ParseHashList(const std::string& text, std::unordered_set<uint64_t>& set) {
+  set.clear();
+  size_t pos = 0;
+  while (pos < text.size()) {
+    size_t end = text.find(',', pos);
+    if (end == std::string::npos) end = text.size();
+    std::string item = text.substr(pos, end - pos);
+    item.erase(0, item.find_first_not_of(" 	"));
+    item.erase(item.find_last_not_of(" 	") + 1);
+    if (!item.empty()) set.insert(std::strtoull(item.c_str(), nullptr, 16));
+    pos = end + 1;
+  }
+}
+// sparrow_split_shaders, parsed when the cvar text changes.
+const std::unordered_set<uint64_t>& SparrowSplitShaders() {
+  static std::string text;
+  static std::unordered_set<uint64_t> set;
+  const std::string& now = REXCVAR_GET(sparrow_split_shaders);
+  if (now != text) {
+    text = now;
+    ParseHashList(text, set);
+  }
+  return set;
+}
 // character_vs, parsed when the cvar text changes.
 const std::unordered_set<uint64_t>& CharacterVertexShaders() {
   static std::string text;
@@ -99,17 +133,7 @@ const std::unordered_set<uint64_t>& CharacterVertexShaders() {
   const std::string& now = REXCVAR_GET(character_vs);
   if (now != text) {
     text = now;
-    set.clear();
-    size_t pos = 0;
-    while (pos < text.size()) {
-      size_t end = text.find(',', pos);
-      if (end == std::string::npos) end = text.size();
-      std::string item = text.substr(pos, end - pos);
-      item.erase(0, item.find_first_not_of(" 	"));
-      item.erase(item.find_last_not_of(" 	") + 1);
-      if (!item.empty()) set.insert(std::strtoull(item.c_str(), nullptr, 16));
-      pos = end + 1;
-    }
+    ParseHashList(text, set);
   }
   return set;
 }
@@ -4103,6 +4127,38 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
           bound_depth_and_color_render_target_formats, &pipeline_handle, &root_signature)) {
     return false;
   }
+  // sparrow_split: a second pipeline with the game's own pixel shader, drawn
+  // on the left of the split (see the draw below).
+  void* split_pipeline_handle = nullptr;
+  double split_fraction = REXCVAR_GET(sparrow_split);
+  if (split_fraction > 0.0 && pixel_shader &&
+      PipelineCache::HasShaderReplacement(pixel_shader->ucode_data_hash())) {
+    const auto& split_set = SparrowSplitShaders();
+    if (split_set.empty() || split_set.count(pixel_shader->ucode_data_hash())) {
+      DxbcShaderTranslator::Modification original_modification = pixel_shader_modification;
+      original_modification.pixel.sparrow_original = 1;
+      auto* original_translation = static_cast<D3D12Shader::D3D12Translation*>(
+          pixel_shader->GetOrCreateTranslation(original_modification.value));
+      ID3D12RootSignature* original_root_signature;
+      if (pipeline_cache_->ConfigurePipeline(
+              vertex_shader_translation, original_translation, primitive_processing_result,
+              normalized_depth_control, normalized_color_mask,
+              bound_depth_and_color_render_target_bits,
+              bound_depth_and_color_render_target_formats, &split_pipeline_handle,
+              &original_root_signature) &&
+          original_root_signature == root_signature) {
+        if (REXCVAR_GET(async_shader_compilation) &&
+            !(deferred_command_list_.IsThreadedRecording() &&
+              REXCVAR_GET(d3d12_threaded_pipeline_wait)) &&
+            pipeline_cache_->GetD3D12PipelineByHandle(split_pipeline_handle) == nullptr &&
+            !pipeline_cache_->WaitForPipeline(split_pipeline_handle, 2000)) {
+          split_pipeline_handle = nullptr;
+        }
+      } else {
+        split_pipeline_handle = nullptr;
+      }
+    }
+  }
   // With threaded recording, the recording thread waits for the pipeline when
   // it replays the draw, so new pipelines found in the rest of the submission
   // are created in parallel instead of one after another on this thread.
@@ -4385,7 +4441,31 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
 
-  // Draw.
+  // Draw. With sparrow_split, the replacement is clipped to the right of the
+  // split and the game's own shader then drawn left of it.
+  auto issue_draw = [&](auto&& draw) {
+    if (!split_pipeline_handle) {
+      draw();
+      return;
+    }
+    const D3D12_RECT full = ff_scissor_;
+    LONG split_x = LONG(ff_viewport_.TopLeftX + ff_viewport_.Width * float(split_fraction));
+    D3D12_RECT right = full;
+    right.left = std::max(full.left, split_x);
+    if (right.left < right.right) {
+      SetScissorRect(right);
+      draw();
+    }
+    D3D12_RECT left = full;
+    left.right = std::min(full.right, split_x);
+    if (left.left < left.right) {
+      deferred_command_list_.SetPipelineStateHandle(split_pipeline_handle);
+      current_guest_pipeline_ = split_pipeline_handle;
+      SetScissorRect(left);
+      draw();
+    }
+    SetScissorRect(full);
+  };
   if (primitive_processing_result.index_buffer_type ==
       PrimitiveProcessor::ProcessedIndexBufferType::kNone) {
     if (memexport_used) {
@@ -4396,8 +4476,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count, 1,
-                                            0, 0);
+    issue_draw([&] {
+      deferred_command_list_.D3DDrawInstanced(primitive_processing_result.host_draw_vertex_count,
+                                              1, 0, 0);
+    });
   } else {
     D3D12_INDEX_BUFFER_VIEW index_buffer_view;
     index_buffer_view.SizeInBytes = primitive_processing_result.host_draw_vertex_count;
@@ -4455,8 +4537,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     SubmitBarriers();
     PROFILE_DRAW_CALL();
     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
-    deferred_command_list_.D3DDrawIndexedInstanced(
-        primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    issue_draw([&] {
+      deferred_command_list_.D3DDrawIndexedInstanced(
+          primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
+    });
     if (scratch_index_buffer != nullptr) {
       ReleaseScratchGPUBuffer(scratch_index_buffer, D3D12_RESOURCE_STATE_INDEX_BUFFER);
     }

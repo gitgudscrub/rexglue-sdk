@@ -833,6 +833,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   // The camera the depth copy was taken with (world -> clip rows, viewport
   // y and z), and the frame of the copy.
   float sparrow_depth_cam_[16] = {};
+  // Project Sparrow wet ground: the rain draw (sparrow_rain_ps) seen this
+  // frame, when it was last seen, and the smoothed wetness (frame row 14).
+  bool sparrow_rain_seen_ = false;
+  double sparrow_rain_last_ = -1e9, sparrow_wet_time_ = -1.0;
+  float sparrow_wet_ = 0.0f;
   float sparrow_depth_cam_yscale_ = -1.0f, sparrow_depth_cam_zscale_ = 1.0f,
         sparrow_depth_cam_zoffset_ = 0.0f;
   uint64_t sparrow_depth_frame_ = 0;

@@ -15,7 +15,8 @@
 //                     6 valid (1), 7 bias in texels, 8-10 world direction
 //                     toward the sun, 11 frame counter (wraps at 2^24),
 //                     12 debug mode (sparrow_debug), 13 ambient grid
-//                     written this frame (1),
+//                     written this frame (1), 14 wetness (0 dry .. 1 wet,
+//                     from the rain, D3D12CommandProcessor),
 //                     16-31 camera world -> clip rows (last frame's),
 //                     32-35 alpha, beta (clip z = alpha * w + beta),
 //                     depth z scale, z offset, 36-39 depth texture
@@ -34,7 +35,9 @@ cbuffer SparrowSunConstants : register(b0) {
   float4 cam[4];         // world -> clip rows
   float4 cam2;           // alpha, beta, z scale, z offset
   float4 cam3;           // depth width, height, y down, valid
-  uint4 pad1[3];         // 52 root constants in all, as the post passes
+  float wet;             // 0 dry .. 1 wet ground
+  uint3 pad0;
+  uint4 pad1[2];         // 52 root constants in all, as the post passes
 };
 
 #if MSAA
@@ -72,6 +75,7 @@ void main(uint3 id : SV_DispatchThreadID) {
     case 11: v = float(frame & 0xFFFFFFu); break;
     case 12: v = float(debug); break;
     case 13: v = float(grid); break;
+    case 14: v = wet; break;
     default:
       if (id.x >= 16u && id.x < 32u) {
         v = cam[(id.x - 16u) / 4u][(id.x - 16u) % 4u];

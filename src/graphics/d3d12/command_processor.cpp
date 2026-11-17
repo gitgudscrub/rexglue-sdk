@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstring>
@@ -291,6 +292,14 @@ REXCVAR_DEFINE_BOOL(sparrow_renderer, false, "GPU/D3D12",
                     "Project Sparrow: hand the sun shadow map and frame data to the material "
                     "shaders (bindless slot 3) each frame; needs post_sun_map and post_ao")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_STRING(sparrow_rain_ps, "6F82A06C66B915E0", "GPU/D3D12",
+                      "Project Sparrow wet ground: the pixel shader hash of the game's rain "
+                      "(the lit sheet around the camera); while it draws the ground gets wet")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_DOUBLE(sparrow_wet, -1.0, "GPU/D3D12",
+                      "Project Sparrow wet ground: -1 = follow the rain (wets in about 10 s, "
+                      "dries in about 60 s); 0..1 = force this wetness (testing)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
                      "Project Sparrow debug: 1 = the material shaders drop the sun wherever "
                      "the Sparrow shadow map covers (shows what they reach); 2 = show only "
@@ -299,8 +308,8 @@ REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
                      "leather, cyan metal, magenta gloss); 5 = lamp shadows alone (white lit, "
                      "black shadowed); 6 = no lamp shadows (A/B); 7 = whether each "
                      "pixel is in the depth copy (green yes, red no); 8 = reflections alone; 9 = "
-                     "no reflections (A/B)")
-    .range(0, 9)
+                     "no reflections (A/B); 10 = wet ground mask (blue puddles, cyan film)")
+    .range(0, 10)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
                     "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "
@@ -3506,6 +3515,28 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
     sc.size = sparrow_sun_size_;
     sc.frame = uint32_t(frame_current_);
     sc.pad0[0] = uint32_t(REXCVAR_GET(sparrow_debug));
+    {
+      // Wet ground: wets while the rain draws, dries slowly after it stops.
+      // By the clock, not frames (the frame rate varies).
+      double now = std::chrono::duration<double>(
+                       std::chrono::steady_clock::now().time_since_epoch())
+                       .count();
+      if (sparrow_rain_seen_) sparrow_rain_last_ = now;
+      sparrow_rain_seen_ = false;
+      double dt = sparrow_wet_time_ < 0.0 ? 0.0 : std::min(now - sparrow_wet_time_, 1.0);
+      sparrow_wet_time_ = now;
+      bool raining = now - sparrow_rain_last_ < 1.5;
+      sparrow_wet_ = raining ? float(std::min(1.0, sparrow_wet_ + dt / 10.0))
+                             : float(std::max(0.0, sparrow_wet_ - dt / 60.0));
+      double forced = REXCVAR_GET(sparrow_wet);
+      float wet = forced >= 0.0 ? float(std::min(forced, 1.0)) : sparrow_wet_;
+      std::memcpy(&sc.pad1[0], &wet, sizeof(wet));
+      static bool logged = false;
+      if (raining && !logged) {
+        logged = true;
+        REXGPU_INFO("Sparrow: rain seen, the ground gets wet");
+      }
+    }
     if (sun_map) {
       for (uint32_t i = 0; i < 3; ++i) {
         sc.centre_radius[i] = sun_map_center_[i];
@@ -4293,6 +4324,18 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       post_sun_zscale_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE);
       post_sun_zoffset_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET);
       post_sun_frame_ = frame_current_;
+    }
+  }
+  if (pixel_shader && !sparrow_rain_seen_ && REXCVAR_GET(sparrow_renderer)) {
+    static std::string rain_text;
+    static uint64_t rain_hash = 0;
+    const std::string& t = REXCVAR_GET(sparrow_rain_ps);
+    if (t != rain_text) {
+      rain_text = t;
+      rain_hash = std::strtoull(t.c_str(), nullptr, 16);
+    }
+    if (rain_hash && pixel_shader->ucode_data_hash() == rain_hash) {
+      sparrow_rain_seen_ = true;
     }
   }
   if (REXCVAR_GET(sparrow_renderer) && sparrow_cam_frame_ != frame_current_ &&

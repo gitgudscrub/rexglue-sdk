@@ -15,7 +15,11 @@
 //                     6 valid (1), 7 bias in texels, 8-10 world direction
 //                     toward the sun, 11 frame counter (wraps at 2^24),
 //                     12 debug mode (sparrow_debug), 13 ambient grid
-//                     written this frame (1).
+//                     written this frame (1),
+//                     16-31 camera world -> clip rows (last frame's),
+//                     32-35 alpha, beta (clip z = alpha * w + beta),
+//                     depth z scale, z offset, 36-39 depth texture
+//                     width, height, y down (1), camera valid (1).
 // Materials bind it through the bindless table at a fixed index
 // (SystemBindlessView::kSparrowSun).
 
@@ -27,7 +31,10 @@ cbuffer SparrowSunConstants : register(b0) {
   float4 centre_radius;  // xyz centre, w signed half width
   float4 depth_size;     // half depth, size, valid, bias texels
   float4 sun_dir;        // xyz toward the sun
-  uint4 pad1[9];         // 52 root constants in all, as the post passes
+  float4 cam[4];         // world -> clip rows
+  float4 cam2;           // alpha, beta, z scale, z offset
+  float4 cam3;           // depth width, height, y down, valid
+  uint4 pad1[3];         // 52 root constants in all, as the post passes
 };
 
 #if MSAA
@@ -65,6 +72,15 @@ void main(uint3 id : SV_DispatchThreadID) {
     case 11: v = float(frame & 0xFFFFFFu); break;
     case 12: v = float(debug); break;
     case 13: v = float(grid); break;
+    default:
+      if (id.x >= 16u && id.x < 32u) {
+        v = cam[(id.x - 16u) / 4u][(id.x - 16u) % 4u];
+      } else if (id.x >= 32u && id.x < 36u) {
+        v = cam2[id.x - 32u];
+      } else if (id.x >= 36u && id.x < 40u) {
+        v = cam3[id.x - 36u];
+      }
+      break;
   }
   sparrow_out[int2(id.x, size + size / 8u)] = v;
 }

@@ -86,6 +86,17 @@ class D3D12CommandProcessor : public CommandProcessor {
   // full-screen scene depth.
   void CaptureSceneDepth(ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
                          uint32_t width, uint32_t height, bool multisampled);
+  // Project Sparrow lamp shadows: the render target cache calls this at a
+  // full-size colour resolve with the scene's depth render target (in
+  // NON_PIXEL_SHADER_RESOURCE): the depth then holds the whole opaque scene,
+  // characters included (they are not in the depth pre-pass). Copies it with
+  // this frame's camera for the next frame's material shaders.
+  // The game draws the screen in EDRAM tiles: each colour resolve brings
+  // one, `rows` rows from the target's row src_y to the copy's row dst_y
+  // (full_height: the whole screen; dst_y 0 = a new frame's first tile).
+  void SparrowCopySceneDepth(ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
+                             uint32_t width, uint32_t full_height, uint32_t rows, uint32_t src_y,
+                             uint32_t dst_y, bool multisampled, bool float24);
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
   // Returns true if the barrier has been inserted (the new state is different).
@@ -167,6 +178,10 @@ class D3D12CommandProcessor : public CommandProcessor {
     // frame data, R32_FLOAT as a 2D array. Shader index 3 in the unbounded
     // table (shaders/sparrow_common.hlsli: SPARROW_SUN_INDEX).
     kSparrowSun,
+    // Project Sparrow: the scene depth after the game's depth pre-pass,
+    // R32_FLOAT (sample 0), for the lamp shadows. Shader index 4
+    // (shaders/sparrow_common.hlsli: SPARROW_DEPTH_INDEX).
+    kSparrowDepth,
 
     kCount,
   };
@@ -787,6 +802,25 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_ambient_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_ambient_ms_pipeline_;
   bool sparrow_logged_ = false;
+  // Project Sparrow lamp shadows: the scene depth copied after the depth
+  // pre-pass (sparrow_depth.cs.hlsl), bound at kSparrowDepth.
+  bool EnsureSparrowDepth(uint32_t width, uint32_t height);
+  Microsoft::WRL::ComPtr<ID3D12Resource> sparrow_depth_;
+  uint32_t sparrow_depth_width_ = 0, sparrow_depth_height_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_depth_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_depth_ms_pipeline_;
+  // The camera (world -> clip rows) from the main world vertex shader
+  // (c0..c3 world-view-projection times the inverse of the c4..c6 world
+  // matrix), for when no lightmapped ground is drawn (interiors, caves).
+  float sparrow_cam_[16] = {};
+  float sparrow_cam_yscale_ = -1.0f, sparrow_cam_zscale_ = 1.0f, sparrow_cam_zoffset_ = 0.0f;
+  uint64_t sparrow_cam_frame_ = 0;
+  // The camera the depth copy was taken with (world -> clip rows, viewport
+  // y and z), and the frame of the copy.
+  float sparrow_depth_cam_[16] = {};
+  float sparrow_depth_cam_yscale_ = -1.0f, sparrow_depth_cam_zscale_ = 1.0f,
+        sparrow_depth_cam_zoffset_ = 0.0f;
+  uint64_t sparrow_depth_frame_ = 0;
 
   // Fallback when the character_vs cvar is empty (it is the reliable test:
   // this one also flags scenery whose vertex pages the game rewrites).

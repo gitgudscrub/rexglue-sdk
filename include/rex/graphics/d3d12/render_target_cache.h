@@ -723,6 +723,12 @@ class D3D12RenderTargetCache final : public RenderTargetCache {
 
   // Temporary storage for DumpRenderTargets.
   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
+  // Project Sparrow lamp shadows: the scene depth target seen at the depth
+  // resolve this frame, copied at the next full-size colour resolve.
+  D3D12RenderTarget* sparrow_scene_depth_rt_ = nullptr;
+  uint64_t sparrow_scene_depth_frame_ = 0;
+  uint32_t sparrow_scene_depth_size_[2] = {};
+  uint32_t sparrow_scene_depth_rows_ = 0;  // rows copied so far this frame
   std::vector<DumpInvocation> dump_invocations_;
   std::vector<ResolveCopyDispatch> direct_resolve_dispatches_;
 

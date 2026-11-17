@@ -296,8 +296,10 @@ REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
                      "the Sparrow shadow map covers (shows what they reach); 2 = show only "
                      "the light Sparrow's materials add (specular, sky reflection); 3 = sky "
                      "visibility; 4 = character materials as colours (grey cloth, brown "
-                     "leather, cyan metal, magenta gloss)")
-    .range(0, 4)
+                     "leather, cyan metal, magenta gloss); 5 = lamp shadows alone (white lit, "
+                     "black shadowed); 6 = no lamp shadows (A/B); 7 = whether each "
+                     "pixel is in the depth copy (green yes, red no)")
+    .range(0, 7)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
                     "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "
@@ -446,6 +448,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/sparrow_sun_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/sparrow_ambient_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/sparrow_ambient_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_depth_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_depth_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_h_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_v_cs.h"
 }  // namespace shaders
@@ -1948,6 +1952,11 @@ bool D3D12CommandProcessor::SetupContext() {
         nullptr, &null_srv_desc,
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kSparrowSun)));
+    // kSparrowDepth: null until EnsureSparrowDepth (reads 0 = no depth).
+    device->CreateShaderResourceView(
+        nullptr, &null_srv_desc,
+        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                      uint32_t(SystemBindlessView::kSparrowDepth)));
     // kSharedMemoryRawSRV.
     shared_memory_->WriteRawSRVDescriptor(provider.OffsetViewDescriptor(
         view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kSharedMemoryRawSRV)));
@@ -3104,6 +3113,8 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   REX_POST_GRADE_PIPELINE(sparrow_sun_ms_pipeline_, sparrow_sun_ms_cs)
   REX_POST_GRADE_PIPELINE(sparrow_ambient_pipeline_, sparrow_ambient_cs)
   REX_POST_GRADE_PIPELINE(sparrow_ambient_ms_pipeline_, sparrow_ambient_ms_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_depth_pipeline_, sparrow_depth_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_depth_ms_pipeline_, sparrow_depth_ms_cs)
 #undef REX_POST_GRADE_PIPELINE
   return true;
 }
@@ -3270,6 +3281,9 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
   bool sparrow = REXCVAR_GET(sparrow_renderer) && bindless_resources_used_ &&
                  sparrow_sun_pipeline_ &&
                  EnsureSparrowSun(sun_map ? sun_map_size_ : std::max(sparrow_sun_size_, 256u));
+  // The lamp shadows' depth copy (SparrowCopySceneDepth) and its camera.
+  bool sparrow_depth = sparrow && sparrow_depth_ && sparrow_depth_frame_ != 0 &&
+                       sparrow_depth_frame_ + 2 >= frame_current_;
   ui::d3d12::util::DescriptorCpuGpuHandlePair d[9];
   if (!RequestOneUseSingleViewDescriptors(sparrow ? 9 : (sun_map ? 7 : 6), d)) {
     return;
@@ -3473,7 +3487,10 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
     struct {
       uint32_t size, frame, pad0[2];
       float centre_radius[4], depth_size[4], sun_dir[4];
-      uint32_t pad1[36];
+      float cam[16];   // world -> clip rows (the previous frame's camera)
+      float cam2[4];   // depth = (z / w) * zs + zo; w = beta / (z / w - alpha)
+      float cam3[4];   // depth texture width, height, y down (1), valid (1)
+      uint32_t pad1[12];
     } sc = {};
     static_assert(sizeof(sc) == sizeof(PostGradeConstants));
     sc.size = sparrow_sun_size_;
@@ -3491,6 +3508,30 @@ void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
     }
     sc.depth_size[1] = float(sparrow_sun_size_);
     sc.pad0[1] = (sun_map && sparrow_ambient_pipeline_) ? 1u : 0u;
+    // The camera for the lamp shadows: the one the depth copy was taken
+    // with, at the end of last frame (the shaders correct for the shift).
+    {
+      const float* m = sparrow_depth_cam_;
+      float zs = sparrow_depth_cam_zscale_, zo = sparrow_depth_cam_zoffset_,
+            ys = sparrow_depth_cam_yscale_;
+      if (sparrow_depth && std::abs(zs) > 1e-6f) {
+        // A perspective camera's clip z is a line in its w: z = alpha * w + beta.
+        double r3 = double(m[12]) * m[12] + double(m[13]) * m[13] + double(m[14]) * m[14];
+        if (r3 > 1e-12) {
+          double alpha = (double(m[8]) * m[12] + double(m[9]) * m[13] + double(m[10]) * m[14]) / r3;
+          double beta = double(m[11]) - alpha * m[15];
+          std::memcpy(sc.cam, m, sizeof(sc.cam));
+          sc.cam2[0] = float(alpha);
+          sc.cam2[1] = float(beta);
+          sc.cam2[2] = zs;
+          sc.cam2[3] = zo;
+          sc.cam3[0] = float(sparrow_depth_width_);
+          sc.cam3[1] = float(sparrow_depth_height_);
+          sc.cam3[2] = ys > 0.0f ? 1.0f : 0.0f;
+          sc.cam3[3] = 1.0f;
+        }
+      }
+    }
     deferred_command_list_.D3DSetComputeRoot32BitConstants(
         UINT(PostGradeRootParameter::kConstants), sizeof(sc) / sizeof(uint32_t), &sc, 0);
     table(PostGradeRootParameter::kMean, sun_map ? d[6] : d[8]);
@@ -3569,6 +3610,139 @@ bool D3D12CommandProcessor::EnsureSparrowSun(uint32_t size) {
       sparrow_sun_.Get(), &srv,
       provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                     uint32_t(SystemBindlessView::kSparrowSun)));
+  return true;
+}
+
+void D3D12CommandProcessor::SparrowCopySceneDepth(ID3D12Resource* depth,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
+                                                  uint32_t width, uint32_t full_height,
+                                                  uint32_t rows, uint32_t src_y, uint32_t dst_y,
+                                                  bool multisampled, bool float24) {
+  if (!REXCVAR_GET(sparrow_renderer) || !sparrow_depth_pipeline_ || !depth || width < 64 ||
+      full_height < 64 || rows == 0 || dst_y + rows > full_height) {
+    return;
+  }
+  uint32_t height = full_height;
+  // The scene's camera, the most recent one seen (the frame counter moves
+  // on part-way through the game's frame): the ground's, else the main
+  // world vertex shader's.
+  const float* m = nullptr;
+  float zs = 1.0f, zo = 0.0f, ys = -1.0f;
+  if (post_sun_frame_ != 0 && post_sun_frame_ + 2 >= frame_current_ &&
+      post_sun_frame_ >= sparrow_cam_frame_) {
+    m = post_sun_view_proj_;
+    zs = post_sun_zscale_;
+    zo = post_sun_zoffset_;
+    ys = post_sun_yscale_;
+  } else if (sparrow_cam_frame_ != 0 && sparrow_cam_frame_ + 2 >= frame_current_) {
+    m = sparrow_cam_;
+    zs = sparrow_cam_zscale_;
+    zo = sparrow_cam_zoffset_;
+    ys = sparrow_cam_yscale_;
+  }
+  if (!m || !EnsureSparrowDepth(width, height)) {
+    static uint32_t miss_logs = 0;
+    if (miss_logs++ == 0) {  // once: menus and cutscenes have no world camera
+      REXGPU_INFO("Sparrow: no depth copy at frame {} (ground camera frame {}, world camera frame {})",
+                  frame_current_, post_sun_frame_, sparrow_cam_frame_);
+    }
+    return;
+  }
+  ui::d3d12::util::DescriptorCpuGpuHandlePair d[2];
+  if (!RequestOneUseSingleViewDescriptors(2, d)) {
+    return;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  device->CopyDescriptorsSimple(1, d[0].first, depth_srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R32_FLOAT;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(sparrow_depth_.Get(), nullptr, &uav, d[1].first);
+  struct {
+    uint32_t width, rows, src_y, dst_y;
+    float depth_scale;
+    uint32_t pad[47];
+  } dc = {};
+  static_assert(sizeof(dc) == sizeof(PostGradeConstants));
+  dc.width = width;
+  dc.rows = rows;
+  dc.src_y = src_y;
+  dc.dst_y = dst_y;
+  // The host keeps 20e4 depth's [0, 2) range as [0, 1): back to the guest's.
+  dc.depth_scale = float24 ? 2.0f : 1.0f;
+  deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(
+      UINT(PostGradeRootParameter::kConstants), sizeof(dc) / sizeof(uint32_t), &dc, 0);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(UINT(PostGradeRootParameter::kSource),
+                                                          d[0].second);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(
+      UINT(PostGradeRootParameter::kDestination), d[1].second);
+  const D3D12_RESOURCE_STATES kShaderRead =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  PushTransitionBarrier(sparrow_depth_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  SetExternalPipeline(multisampled ? sparrow_depth_ms_pipeline_.Get()
+                                   : sparrow_depth_pipeline_.Get());
+  SubmitBarriers();
+  deferred_command_list_.D3DDispatch((width + 7) / 8, (rows + 7) / 8, 1);
+  PushTransitionBarrier(sparrow_depth_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+  if (dst_y != 0) {
+    return;  // a later tile: the camera is the first tile's
+  }
+  std::memcpy(sparrow_depth_cam_, m, sizeof(sparrow_depth_cam_));
+  sparrow_depth_cam_yscale_ = ys;
+  sparrow_depth_cam_zscale_ = zs;
+  sparrow_depth_cam_zoffset_ = zo;
+  sparrow_depth_frame_ = frame_current_;
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXGPU_INFO("Sparrow: scene depth {}x{}{} copied for the lamp shadows (first tile {} rows)",
+                width, height, multisampled ? " (MSAA)" : "", rows);
+  }
+}
+
+bool D3D12CommandProcessor::EnsureSparrowDepth(uint32_t width, uint32_t height) {
+  if (sparrow_depth_ && sparrow_depth_width_ == width && sparrow_depth_height_ == height) {
+    return true;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (sparrow_depth_) {
+    sparrow_depth_->AddRef();
+    resources_for_deletion_.emplace_back(submission_current_, sparrow_depth_.Get());
+    sparrow_depth_.Reset();
+  }
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R32_FLOAT;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+          nullptr, IID_PPV_ARGS(&sparrow_depth_)))) {
+    REXGPU_ERROR("Sparrow: failed to create the depth copy");
+    sparrow_depth_width_ = sparrow_depth_height_ = 0;
+    return false;
+  }
+  sparrow_depth_width_ = width;
+  sparrow_depth_height_ = height;
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R32_FLOAT;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2DArray.MipLevels = 1;
+  srv.Texture2DArray.ArraySize = 1;
+  device->CreateShaderResourceView(
+      sparrow_depth_.Get(), &srv,
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kSparrowDepth)));
   return true;
 }
 
@@ -4012,6 +4186,52 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       post_sun_zscale_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE);
       post_sun_zoffset_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET);
       post_sun_frame_ = frame_current_;
+    }
+  }
+  if (REXCVAR_GET(sparrow_renderer) && sparrow_cam_frame_ != frame_current_ &&
+      vertex_shader->ucode_data_hash() == 0xECD66A10092E6562ull &&
+      std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f >= 480.0f) {
+    // Project Sparrow lamp shadows: the camera from the main world vertex
+    // shader, c0..c3 (world-view-projection rows) times the inverse of the
+    // c4..c6 world matrix (3x4 rows), once a frame.
+    double w[16] = {}, wvp[16];
+    for (uint32_t i = 0; i < 12; ++i) {
+      w[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + 16 + i);
+    }
+    w[15] = 1.0;
+    for (uint32_t i = 0; i < 16; ++i) {
+      wvp[i] = regs.Get<float>(XE_GPU_REG_SHADER_CONSTANT_000_X + i);
+    }
+    // Inverse of an affine 3x4: R^-1 and -R^-1 t.
+    double a = w[0], b = w[1], c = w[2], d = w[4], e = w[5], f = w[6], g = w[8], h = w[9],
+           k = w[10];
+    double det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+    if (std::abs(det) > 1e-12) {
+      double inv[16] = {};
+      inv[0] = (e * k - f * h) / det;
+      inv[1] = (c * h - b * k) / det;
+      inv[2] = (b * f - c * e) / det;
+      inv[4] = (f * g - d * k) / det;
+      inv[5] = (a * k - c * g) / det;
+      inv[6] = (c * d - a * f) / det;
+      inv[8] = (d * h - e * g) / det;
+      inv[9] = (b * g - a * h) / det;
+      inv[10] = (a * e - b * d) / det;
+      for (uint32_t r = 0; r < 3; ++r) {
+        inv[r * 4 + 3] = -(inv[r * 4 + 0] * w[3] + inv[r * 4 + 1] * w[7] + inv[r * 4 + 2] * w[11]);
+      }
+      inv[15] = 1.0;
+      for (uint32_t r = 0; r < 4; ++r) {
+        for (uint32_t col = 0; col < 4; ++col) {
+          double s = 0.0;
+          for (uint32_t i = 0; i < 4; ++i) s += wvp[r * 4 + i] * inv[i * 4 + col];
+          sparrow_cam_[r * 4 + col] = float(s);
+        }
+      }
+      sparrow_cam_yscale_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE);
+      sparrow_cam_zscale_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZSCALE);
+      sparrow_cam_zoffset_ = regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_ZOFFSET);
+      sparrow_cam_frame_ = frame_current_;
     }
   }
   if (REXCVAR_GET(log_frame_shaders) > 0) {

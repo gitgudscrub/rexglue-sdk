@@ -1245,6 +1245,43 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
             return false;
           }
         }
+        // Project Sparrow: the full-width colour resolves after the scene
+        // depth resolve come after the opaque scene (characters included),
+        // one per EDRAM tile from the top: copy each tile's depth (from the
+        // target's top) below the last for the lamp shadows. The tiles'
+        // resolves clear the target for the next one; a full-size resolve
+        // without a clear right after the depth resolve is something else.
+        if (!resolve_info.IsCopyingDepth() && sparrow_scene_depth_rt_ &&
+            resolve_info.rb_copy_control.color_clear_enable &&
+            sparrow_scene_depth_frame_ == command_processor_.GetCurrentFrame()) {
+          uint32_t width = uint32_t(resolve_info.coordinate_info.width_div_8) * 8;
+          uint32_t height = uint32_t(resolve_info.height_div_8) * 8;
+          uint32_t rows = height * draw_resolution_scale_y();
+          if (width * draw_resolution_scale_x() == sparrow_scene_depth_size_[0] && height >= 8 &&
+              sparrow_scene_depth_rows_ + rows <= sparrow_scene_depth_size_[1]) {
+            // The tile's own depth: the one bound for the scene's draws, not
+            // necessarily the pre-pass target.
+            auto* rt = sparrow_scene_depth_rt_;
+            RenderTarget* const* bound = last_update_accumulated_render_targets();
+            if (bound[0] && bound[0]->key().is_depth) {
+              rt = static_cast<D3D12RenderTarget*>(bound[0]);
+            }
+            uint32_t dst_y = sparrow_scene_depth_rows_;
+            sparrow_scene_depth_rows_ += rows;
+            if (sparrow_scene_depth_rows_ >= sparrow_scene_depth_size_[1]) {
+              sparrow_scene_depth_rt_ = nullptr;
+            }
+            command_processor_.PushTransitionBarrier(
+                rt->resource(),
+                rt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+            command_processor_.SparrowCopySceneDepth(
+                rt->resource(), rt->descriptor_srv().GetHandle(), sparrow_scene_depth_size_[0],
+                sparrow_scene_depth_size_[1], rows, 0, dst_y,
+                rt->key().msaa_samples != xenos::MsaaSamples::k1X,
+                rt->key().GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24FS8);
+          }
+        }
         // Ambient occlusion: a large, non-square depth resolve
         // is the scene depth (square ones are shadow maps). The dump above
         // left the owning host render target readable.
@@ -1272,6 +1309,13 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                                                    width * draw_resolution_scale_x(),
                                                    height * draw_resolution_scale_y(),
                                                    rt->key().msaa_samples != xenos::MsaaSamples::k1X);
+              // Project Sparrow: the same target holds the whole scene by
+              // the next full-size colour resolve (lamp shadows).
+              sparrow_scene_depth_rt_ = rt;
+              sparrow_scene_depth_frame_ = command_processor_.GetCurrentFrame();
+              sparrow_scene_depth_size_[0] = width * draw_resolution_scale_x();
+              sparrow_scene_depth_size_[1] = height * draw_resolution_scale_y();
+              sparrow_scene_depth_rows_ = 0;
               break;
             }
           }

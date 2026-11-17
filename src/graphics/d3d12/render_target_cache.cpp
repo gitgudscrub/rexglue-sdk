@@ -1280,6 +1280,32 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
                 sparrow_scene_depth_size_[1], rows, 0, dst_y,
                 rt->key().msaa_samples != xenos::MsaaSamples::k1X,
                 rt->key().GetDepthFormat() == xenos::DepthRenderTargetFormat::kD24FS8);
+            // The tile's colour for the reflections: colour slot 0 of the
+            // scene's draws, float formats only (their SRV reads as float).
+            auto* crt = static_cast<D3D12RenderTarget*>(bound[1]);
+            if (crt && !crt->key().is_depth) {
+              xenos::ColorRenderTargetFormat cf = crt->key().GetColorFormat();
+              if (cf == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT ||
+                  cf == xenos::ColorRenderTargetFormat::k_2_10_10_10_FLOAT_AS_16_16_16_16 ||
+                  cf == xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+                  cf == xenos::ColorRenderTargetFormat::k_2_10_10_10) {
+                command_processor_.PushTransitionBarrier(
+                    crt->resource(),
+                    crt->SetResourceState(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+                command_processor_.SparrowCopySceneColor(
+                    crt->resource(), crt->descriptor_srv().GetHandle(),
+                    sparrow_scene_depth_size_[0], sparrow_scene_depth_size_[1], rows, dst_y,
+                    crt->key().msaa_samples != xenos::MsaaSamples::k1X);
+              } else {
+                static bool color_logged = false;
+                if (!color_logged) {
+                  color_logged = true;
+                  REXGPU_INFO("Sparrow: scene colour format {} not copied (reflections off)",
+                              crt->key().GetFormatName());
+                }
+              }
+            }
           }
         }
         // Ambient occlusion: a large, non-square depth resolve

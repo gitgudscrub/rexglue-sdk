@@ -97,6 +97,11 @@ class D3D12CommandProcessor : public CommandProcessor {
   void SparrowCopySceneDepth(ID3D12Resource* depth, D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
                              uint32_t width, uint32_t full_height, uint32_t rows, uint32_t src_y,
                              uint32_t dst_y, bool multisampled, bool float24);
+  // The same tile's colour (float formats only), into the colour copy at
+  // row dst_y, after SparrowCopySceneDepth for that tile.
+  void SparrowCopySceneColor(ID3D12Resource* color, D3D12_CPU_DESCRIPTOR_HANDLE color_srv,
+                             uint32_t width, uint32_t full_height, uint32_t rows, uint32_t dst_y,
+                             bool multisampled);
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
   // Returns true if the barrier has been inserted (the new state is different).
@@ -182,6 +187,10 @@ class D3D12CommandProcessor : public CommandProcessor {
     // R32_FLOAT (sample 0), for the lamp shadows. Shader index 4
     // (shaders/sparrow_common.hlsli: SPARROW_DEPTH_INDEX).
     kSparrowDepth,
+    // Project Sparrow: the scene colour (the game's HDR target, as written,
+    // samples averaged), R16G16B16A16_FLOAT, copied with the depth, for the
+    // reflections. Shader index 5 (SPARROW_COLOR_INDEX).
+    kSparrowColor,
 
     kCount,
   };
@@ -809,6 +818,12 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint32_t sparrow_depth_width_ = 0, sparrow_depth_height_ = 0;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_depth_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_depth_ms_pipeline_;
+  // Project Sparrow reflections: the scene colour, bound at kSparrowColor.
+  bool EnsureSparrowColor(uint32_t width, uint32_t height);
+  Microsoft::WRL::ComPtr<ID3D12Resource> sparrow_color_;
+  uint32_t sparrow_color_width_ = 0, sparrow_color_height_ = 0;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_color_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> sparrow_color_ms_pipeline_;
   // The camera (world -> clip rows) from the main world vertex shader
   // (c0..c3 world-view-projection times the inverse of the c4..c6 world
   // matrix), for when no lightmapped ground is drawn (interiors, caves).

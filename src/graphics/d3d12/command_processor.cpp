@@ -298,8 +298,9 @@ REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
                      "visibility; 4 = character materials as colours (grey cloth, brown "
                      "leather, cyan metal, magenta gloss); 5 = lamp shadows alone (white lit, "
                      "black shadowed); 6 = no lamp shadows (A/B); 7 = whether each "
-                     "pixel is in the depth copy (green yes, red no)")
-    .range(0, 7)
+                     "pixel is in the depth copy (green yes, red no); 8 = reflections alone; 9 = "
+                     "no reflections (A/B)")
+    .range(0, 9)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
                     "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "
@@ -450,6 +451,8 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/sparrow_ambient_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/sparrow_depth_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/sparrow_depth_ms_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_color_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/sparrow_color_ms_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_h_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_ao_blur_v_cs.h"
 }  // namespace shaders
@@ -1957,6 +1960,11 @@ bool D3D12CommandProcessor::SetupContext() {
         nullptr, &null_srv_desc,
         provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
                                       uint32_t(SystemBindlessView::kSparrowDepth)));
+    // kSparrowColor: null until EnsureSparrowColor.
+    device->CreateShaderResourceView(
+        nullptr, &null_srv_desc,
+        provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                      uint32_t(SystemBindlessView::kSparrowColor)));
     // kSharedMemoryRawSRV.
     shared_memory_->WriteRawSRVDescriptor(provider.OffsetViewDescriptor(
         view_bindless_heap_cpu_start_, uint32_t(SystemBindlessView::kSharedMemoryRawSRV)));
@@ -3115,6 +3123,8 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   REX_POST_GRADE_PIPELINE(sparrow_ambient_ms_pipeline_, sparrow_ambient_ms_cs)
   REX_POST_GRADE_PIPELINE(sparrow_depth_pipeline_, sparrow_depth_cs)
   REX_POST_GRADE_PIPELINE(sparrow_depth_ms_pipeline_, sparrow_depth_ms_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_color_pipeline_, sparrow_color_cs)
+  REX_POST_GRADE_PIPELINE(sparrow_color_ms_pipeline_, sparrow_color_ms_cs)
 #undef REX_POST_GRADE_PIPELINE
   return true;
 }
@@ -3700,6 +3710,103 @@ void D3D12CommandProcessor::SparrowCopySceneDepth(ID3D12Resource* depth,
     REXGPU_INFO("Sparrow: scene depth {}x{}{} copied for the lamp shadows (first tile {} rows)",
                 width, height, multisampled ? " (MSAA)" : "", rows);
   }
+}
+
+void D3D12CommandProcessor::SparrowCopySceneColor(ID3D12Resource* color,
+                                                  D3D12_CPU_DESCRIPTOR_HANDLE color_srv,
+                                                  uint32_t width, uint32_t full_height,
+                                                  uint32_t rows, uint32_t dst_y,
+                                                  bool multisampled) {
+  if (!REXCVAR_GET(sparrow_renderer) || !sparrow_color_pipeline_ || !color || width < 64 ||
+      full_height < 64 || rows == 0 || dst_y + rows > full_height ||
+      !EnsureSparrowColor(width, full_height)) {
+    return;
+  }
+  ui::d3d12::util::DescriptorCpuGpuHandlePair d[2];
+  if (!RequestOneUseSingleViewDescriptors(2, d)) {
+    return;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  device->CopyDescriptorsSimple(1, d[0].first, color_srv, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+  D3D12_UNORDERED_ACCESS_VIEW_DESC uav = {};
+  uav.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+  device->CreateUnorderedAccessView(sparrow_color_.Get(), nullptr, &uav, d[1].first);
+  struct {
+    uint32_t width, rows, src_y, dst_y;
+    uint32_t pad[48];
+  } dc = {};
+  static_assert(sizeof(dc) == sizeof(PostGradeConstants));
+  dc.width = width;
+  dc.rows = rows;
+  dc.src_y = 0;
+  dc.dst_y = dst_y;
+  deferred_command_list_.D3DSetComputeRootSignature(post_grade_root_signature_.Get());
+  deferred_command_list_.D3DSetComputeRoot32BitConstants(
+      UINT(PostGradeRootParameter::kConstants), sizeof(dc) / sizeof(uint32_t), &dc, 0);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(UINT(PostGradeRootParameter::kSource),
+                                                          d[0].second);
+  deferred_command_list_.D3DSetComputeRootDescriptorTable(
+      UINT(PostGradeRootParameter::kDestination), d[1].second);
+  const D3D12_RESOURCE_STATES kShaderRead =
+      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+  PushTransitionBarrier(sparrow_color_.Get(), kShaderRead, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  SetExternalPipeline(multisampled ? sparrow_color_ms_pipeline_.Get()
+                                   : sparrow_color_pipeline_.Get());
+  SubmitBarriers();
+  deferred_command_list_.D3DDispatch((width + 7) / 8, (rows + 7) / 8, 1);
+  PushTransitionBarrier(sparrow_color_.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kShaderRead);
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    REXGPU_INFO("Sparrow: scene colour {}x{}{} copied for the reflections", width, full_height,
+                multisampled ? " (MSAA)" : "");
+  }
+}
+
+bool D3D12CommandProcessor::EnsureSparrowColor(uint32_t width, uint32_t height) {
+  if (sparrow_color_ && sparrow_color_width_ == width && sparrow_color_height_ == height) {
+    return true;
+  }
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  if (sparrow_color_) {
+    sparrow_color_->AddRef();
+    resources_for_deletion_.emplace_back(submission_current_, sparrow_color_.Get());
+    sparrow_color_.Reset();
+  }
+  D3D12_RESOURCE_DESC desc = {};
+  desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+  desc.Width = width;
+  desc.Height = height;
+  desc.DepthOrArraySize = 1;
+  desc.MipLevels = 1;
+  desc.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  desc.SampleDesc.Count = 1;
+  desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  if (FAILED(device->CreateCommittedResource(
+          &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
+          D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE |
+              D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+          nullptr, IID_PPV_ARGS(&sparrow_color_)))) {
+    REXGPU_ERROR("Sparrow: failed to create the colour copy");
+    sparrow_color_width_ = sparrow_color_height_ = 0;
+    return false;
+  }
+  sparrow_color_width_ = width;
+  sparrow_color_height_ = height;
+  D3D12_SHADER_RESOURCE_VIEW_DESC srv = {};
+  srv.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+  srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+  srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+  srv.Texture2DArray.MipLevels = 1;
+  srv.Texture2DArray.ArraySize = 1;
+  device->CreateShaderResourceView(
+      sparrow_color_.Get(), &srv,
+      provider.OffsetViewDescriptor(view_bindless_heap_cpu_start_,
+                                    uint32_t(SystemBindlessView::kSparrowColor)));
+  return true;
 }
 
 bool D3D12CommandProcessor::EnsureSparrowDepth(uint32_t width, uint32_t height) {

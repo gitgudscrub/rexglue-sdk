@@ -362,6 +362,11 @@ REXCVAR_DEFINE_BOOL(post_sun_map_flip, false, "GPU/D3D12",
                     "Sun shadow map: mirror the map's up axis (swaps which triangle faces "
                     "the game's culling keeps when drawing from the sun)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_sun_map_batch, true, "GPU/D3D12",
+                    "Sun shadow map: collect the redraws and draw them into the map in one "
+                    "block, instead of switching the depth target for every draw")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 REXCVAR_DEFINE_STRING(post_sun_map_skip_vs, "129F7F2793DA9084", "GPU/D3D12",
                       "Sun shadow map: vertex shader hashes (comma separated) whose position does "
                       "not come from c0..c3, so they are not redrawn from the sun")
@@ -3403,6 +3408,29 @@ bool InvertMatrix4x4(const float* m, float* out) {
 }
 }  // namespace
 
+void D3D12CommandProcessor::FlushSunMapBatch() {
+  if (!sun_batch_open_) {
+    return;
+  }
+  sun_batch_open_ = false;
+  if (!deferred_command_list_.HasSide()) {
+    return;
+  }
+  // The redraws read guest memory through the shared memory buffer.
+  shared_memory_->UseForReading();
+  SubmitBarriers();
+  deferred_command_list_.SpliceSide();
+  // The command list is now in whatever state the batch left it.
+  current_guest_pipeline_ = nullptr;
+  current_external_pipeline_ = nullptr;
+  current_graphics_root_signature_ = nullptr;
+  current_graphics_root_up_to_date_ = 0;
+  primitive_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  ff_viewport_update_needed_ = true;
+  ff_scissor_update_needed_ = true;
+  render_target_cache_->InvalidateCommandListRenderTargets();
+}
+
 void D3D12CommandProcessor::CaptureSceneDepth(ID3D12Resource* depth,
                                               D3D12_CPU_DESCRIPTOR_HANDLE depth_srv,
                                               uint32_t width, uint32_t height,
@@ -4200,6 +4228,7 @@ bool D3D12CommandProcessor::SetupSunMapFrame() {
     sun_map_srv_state_ = false;
     SubmitBarriers();
   }
+  FlushSunMapBatch();
   deferred_command_list_.D3DClearDepthStencilView(
       sun_map_dsv_heap_->GetCPUDescriptorHandleForHeapStart(),
       D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 0.0f, 0, 0, nullptr);
@@ -4250,6 +4279,82 @@ bool D3D12CommandProcessor::ReplayDrawIntoSunMap(const D3D12Shader* vertex_shade
     }
   }
   cbuffer_binding_float_vertex_.up_to_date = false;
+  const bool batch = REXCVAR_GET(post_sun_map_batch) && bindless_resources_used_ &&
+                     (!indexed || sun_index_buffer_batchable_);
+  if (!batch) {
+    FlushSunMapBatch();
+  } else {
+    // Pending barriers belong before this point in the main stream.
+    SubmitBarriers();
+    if (sun_batch_open_ && sun_batch_sampler_heap_ != sampler_bindless_heap_current_) {
+      FlushSunMapBatch();
+    }
+    void* main_pipeline = current_guest_pipeline_;
+    ID3D12PipelineState* main_external_pipeline = current_external_pipeline_;
+    ID3D12RootSignature* main_root_signature = current_graphics_root_signature_;
+    uint32_t main_root_up_to_date = current_graphics_root_up_to_date_;
+    D3D_PRIMITIVE_TOPOLOGY main_topology = primitive_topology_;
+    ID3D12DescriptorHeap* sampler_heap_before = sampler_bindless_heap_current_;
+    deferred_command_list_.SetSideCapture(true);
+    if (!sun_batch_open_) {
+      sun_batch_open_ = true;
+      sun_batch_pipeline_ = nullptr;
+      sun_batch_root_signature_ = nullptr;
+      sun_batch_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+      sun_batch_sampler_heap_ = sampler_bindless_heap_current_;
+      if (bindless_resources_used_) {
+        deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_,
+                                                  sampler_bindless_heap_current_);
+      }
+      deferred_command_list_.D3DOMSetRenderTargets(0, nullptr, FALSE, &dsv);
+      deferred_command_list_.RSSetViewport(
+          D3D12_VIEWPORT{0.0f, 0.0f, float(sun_map_size_), float(sun_map_size_), 0.0f, 1.0f});
+      deferred_command_list_.RSSetScissorRect(
+          D3D12_RECT{0, 0, LONG(sun_map_size_), LONG(sun_map_size_)});
+    }
+    if (sun_batch_pipeline_ != main_pipeline) {
+      deferred_command_list_.SetPipelineStateHandle(main_pipeline);
+      sun_batch_pipeline_ = main_pipeline;
+    }
+    if (sun_batch_topology_ != main_topology) {
+      deferred_command_list_.D3DIASetPrimitiveTopology(main_topology);
+      sun_batch_topology_ = main_topology;
+    }
+    if (indexed) {
+      deferred_command_list_.D3DIASetIndexBuffer(&sun_index_buffer_view_);
+    }
+    // Every root binding is set again in the batch (the main stream may have
+    // changed any of them since the last batched draw).
+    current_graphics_root_signature_ = sun_batch_root_signature_;
+    current_graphics_root_up_to_date_ = 0;
+    bool batch_bound = UpdateBindings(vertex_shader, pixel_shader, root_signature, false);
+    if (batch_bound) {
+      if (indexed) {
+        deferred_command_list_.D3DDrawIndexedInstanced(vertex_count, 1, 0, 0, 0);
+      } else {
+        deferred_command_list_.D3DDrawInstanced(vertex_count, 1, 0, 0);
+      }
+    }
+    sun_batch_root_signature_ = current_graphics_root_signature_;
+    sun_batch_sampler_heap_ = sampler_bindless_heap_current_;
+    deferred_command_list_.SetSideCapture(false);
+    current_guest_pipeline_ = main_pipeline;
+    current_external_pipeline_ = main_external_pipeline;
+    current_graphics_root_signature_ = main_root_signature;
+    current_graphics_root_up_to_date_ = main_root_up_to_date;
+    primitive_topology_ = main_topology;
+    if (sampler_bindless_heap_current_ != sampler_heap_before) {
+      // The sampler heap overflowed while binding: the main stream needs the
+      // new heap too.
+      deferred_command_list_.SetDescriptorHeaps(view_bindless_heap_,
+                                                sampler_bindless_heap_current_);
+      current_graphics_root_up_to_date_ = 0;
+    }
+    SubmitBarriers();
+    for (uint32_t i = 0; i < 16; ++i) regs[XE_GPU_REG_SHADER_CONSTANT_000_X + i] = saved[i];
+    cbuffer_binding_float_vertex_.up_to_date = false;
+    return batch_bound;
+  }
   deferred_command_list_.D3DOMSetRenderTargets(0, nullptr, FALSE, &dsv);
   render_target_cache_->InvalidateCommandListRenderTargets();
   D3D12_VIEWPORT viewport = {0.0f, 0.0f, float(sun_map_size_), float(sun_map_size_), 0.0f, 1.0f};
@@ -5077,6 +5182,10 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
         return false;
     }
     deferred_command_list_.D3DIASetIndexBuffer(&index_buffer_view);
+    // A scratch index buffer is reused by later draws, so a batched sun map
+    // redraw (which runs later) cannot use it.
+    sun_index_buffer_view_ = index_buffer_view;
+    sun_index_buffer_batchable_ = scratch_index_buffer == nullptr;
     if (memexport_used) {
       shared_memory_->UseForWriting();
     } else {
@@ -5107,6 +5216,9 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
                 uint32_t(normalized_depth_control.zfunc), uint32_t(dynamic_mesh),
                 std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE)) * 2.0f,
                 std::abs(regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE)) * 2.0f);
+  }
+  if (sun_batch_open_ && normalized_color_mask != 0) {
+    FlushSunMapBatch();
   }
   if (REXCVAR_GET(post_sun_map) && REXCVAR_GET(post_sun_shadows) && REXCVAR_GET(post_ao) &&
       REXCVAR_GET(post_grade) && host_render_targets_used && !memexport_used &&
@@ -5887,6 +5999,9 @@ bool D3D12CommandProcessor::EnsureWritableCommandAllocator() {
 
 bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  if (submission_open_) {
+    FlushSunMapBatch();
+  }
 
   // Make sure there is a command allocator to write commands to.
   if (submission_open_ && !EnsureWritableCommandAllocator()) {

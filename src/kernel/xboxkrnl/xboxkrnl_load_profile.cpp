@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -45,6 +46,12 @@ REXCVAR_DEFINE_BOOL(diag_load_profile, false, "Kernel",
                     "Diagnostic: once a second, log guest disk reads and, per thread, CPU use, "
                     "sleeps, waits and yields ([load-prof] lines), long waits ([wait]) and "
                     "stalls ([stall]). For finding what loading time is spent on. Costs CPU.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_STRING(diag_load_profile_dump, "", "Kernel",
+                      "Diagnostic: with diag_load_profile_sample, append every sampled call "
+                      "chain (24 deep) to this file once a second, as \"tid count rva rva ...\" "
+                      "lines (rva = offset in fable_2.exe), for offline profiles. Empty = off.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(diag_load_profile_sample, false, "Kernel",
@@ -258,6 +265,8 @@ std::unordered_map<uint32_t, HostThreadCpu> SampleHostThreads() {
 // about every 2 ms, records the instruction pointer and the first return
 // address inside the game executable found on the stack, and reports the
 // hottest functions once a second.
+constexpr size_t kChainDepth = 24;
+
 struct SampleBuckets {
   uint64_t samples = 0;
   std::unordered_map<uint64_t, uint32_t> leaf;
@@ -265,6 +274,9 @@ struct SampleBuckets {
   // Call chains: key = the first (up to 8) addresses inside the game executable
   // found on the stack, innermost first, as raw bytes.
   std::unordered_map<std::string, uint32_t> chain;
+  // diag_load_profile_dump only: the leaf and the stack values inside any
+  // module of kDumpModules (host code too), innermost first.
+  std::unordered_map<std::string, uint32_t> host_chain;
 };
 
 std::mutex g_sample_mutex;
@@ -276,12 +288,40 @@ std::atomic<bool> g_sampler_started{false};
 uintptr_t g_exe_begin = 0;
 uintptr_t g_exe_end = 0;
 
-void InitExeRange() {
-  auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+// Modules whose addresses the dump records (index = the "m" in "m:rva").
+const wchar_t* const kDumpModules[] = {nullptr, L"rexgpu-xenos.dll", L"rexruntime.dll",
+                                       L"ntdll.dll", L"KernelBase.dll", L"nvwgf2umx.dll",
+                                       L"d3d12core.dll", L"kernel32.dll"};
+constexpr size_t kDumpModuleCount = sizeof(kDumpModules) / sizeof(kDumpModules[0]);
+uintptr_t g_module_begin[kDumpModuleCount] = {};
+uintptr_t g_module_end[kDumpModuleCount] = {};
+
+void InitModuleRange(size_t index) {
+  auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(kDumpModules[index]));
+  if (!base) {
+    return;
+  }
   auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
   auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
-  g_exe_begin = base;
-  g_exe_end = base + nt->OptionalHeader.SizeOfImage;
+  g_module_begin[index] = base;
+  g_module_end[index] = base + nt->OptionalHeader.SizeOfImage;
+}
+
+int DumpModuleOf(uint64_t address) {
+  for (size_t i = 0; i < kDumpModuleCount; ++i) {
+    if (address >= g_module_begin[i] && address < g_module_end[i]) {
+      return int(i);
+    }
+  }
+  return -1;
+}
+
+void InitExeRange() {
+  for (size_t i = 0; i < kDumpModuleCount; ++i) {
+    InitModuleRange(i);
+  }
+  g_exe_begin = g_module_begin[0];
+  g_exe_end = g_module_end[0];
 }
 
 void SamplerMain() {
@@ -294,6 +334,7 @@ void SamplerMain() {
       continue;
     }
     Sleep(2);
+    const bool dump_on = !REXCVAR_GET(diag_load_profile_dump).empty();
     std::vector<uint32_t> targets;
     {
       std::lock_guard<std::mutex> lock(g_sample_mutex);
@@ -350,7 +391,7 @@ void SamplerMain() {
         uint64_t previous = 0;
         size_t count = 0;
         auto add = [&](uint64_t address) {
-          if (count >= 8 || address < g_exe_begin || address >= g_exe_end || address == previous) {
+          if (count >= kChainDepth || address < g_exe_begin || address >= g_exe_end || address == previous) {
             return;
           }
           chain_key.append(reinterpret_cast<const char*>(&address), sizeof(address));
@@ -358,12 +399,38 @@ void SamplerMain() {
           ++count;
         };
         add(leaf);
-        for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && count < 8; ++i) {
+        for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && count < kChainDepth; ++i) {
+          add(stack[i]);
+        }
+      }
+      std::string host_key;
+      if (dump_on) {
+        uint64_t previous = 0;
+        size_t count = 0;
+        auto add = [&](uint64_t address) {
+          if (count >= kChainDepth || address == previous || DumpModuleOf(address) < 0) {
+            return;
+          }
+          host_key.append(reinterpret_cast<const char*>(&address), sizeof(address));
+          previous = address;
+          ++count;
+        };
+        add(leaf);
+        if (host_key.empty()) {
+          // Leaf outside the known modules (another DLL): keep a marker.
+          uint64_t unknown = 0;
+          host_key.append(reinterpret_cast<const char*>(&unknown), sizeof(unknown));
+          ++count;
+        }
+        for (size_t i = 0; i < stack_bytes / sizeof(uint64_t) && count < kChainDepth; ++i) {
           add(stack[i]);
         }
       }
       std::lock_guard<std::mutex> lock(g_sample_mutex);
       SampleBuckets& buckets = g_sample_buckets[tid];
+      if (!host_key.empty()) {
+        ++buckets.host_chain[host_key];
+      }
       ++buckets.samples;
       ++buckets.leaf[leaf];
       if (game_frame) {
@@ -557,6 +624,7 @@ void ReporterMain() {
         continue;
       }
       Row row;
+      row.host_tid = tid;
       row.label = fmt::format("host {}", tid);
       auto host_it = host.find(tid);
       if (host_it != host.end() && !host_it->second.name.empty()) {
@@ -625,13 +693,38 @@ void ReporterMain() {
       // Next second: the (up to) 4 busiest guest threads.
       g_sample_targets.clear();
       for (const Row& row : rows) {
-        if (row.guest && row.cpu_pct >= 30.0 && g_sample_targets.size() < 4) {
+        bool gpu_thread = !row.guest && (row.label.find("GPU Commands") != std::string::npos ||
+                                          row.label.find("Command Recorder") != std::string::npos);
+        if ((row.guest || gpu_thread) && row.cpu_pct >= (gpu_thread ? 15.0 : 30.0) && g_sample_targets.size() < 6) {
           g_sample_targets.push_back(row.host_tid);
         }
       }
     }
     for (const Row& row : rows) {
       labels[row.host_tid] = row.label;
+    }
+    if (!REXCVAR_GET(diag_load_profile_dump).empty()) {
+      if (FILE* dump = std::fopen(REXCVAR_GET(diag_load_profile_dump).c_str(), "a")) {
+        for (const auto& [tid, sampled] : buckets) {
+          auto label_it = labels.find(tid);
+          std::fprintf(dump, "# %u %s\n", tid,
+                       label_it != labels.end() ? label_it->second.c_str() : "?");
+          for (const auto& [key, count] : sampled.host_chain) {
+            std::fprintf(dump, "%u %u", tid, count);
+            for (size_t offset = 0; offset + sizeof(uint64_t) <= key.size();
+                 offset += sizeof(uint64_t)) {
+              uint64_t address = 0;
+              std::memcpy(&address, key.data() + offset, sizeof(address));
+              int module = DumpModuleOf(address);
+              std::fprintf(dump, " %d:%llx", module,
+                           module < 0 ? 0ull
+                                      : (unsigned long long)(address - g_module_begin[module]));
+            }
+            std::fprintf(dump, "\n");
+          }
+        }
+        std::fclose(dump);
+      }
     }
     for (const auto& [tid, sampled] : buckets) {
       if (!sampled.samples) {

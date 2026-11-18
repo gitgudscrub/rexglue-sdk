@@ -33,6 +33,23 @@ DeferredCommandList::~DeferredCommandList() {
 void DeferredCommandList::Reset() {
   assert_null(threaded_list_);
   command_stream_.clear();
+  side_stream_.clear();
+  side_capture_ = false;
+}
+
+void DeferredCommandList::SpliceSide() {
+  if (side_stream_.empty()) {
+    return;
+  }
+  size_t new_size = command_stream_.size() + side_stream_.size();
+  if (threaded_list_ != nullptr && new_size > command_stream_.capacity()) {
+    // As in WriteCommand: the recording thread may be reading the stream.
+    PublishThreaded();
+    WaitUntilRecorded(published_position_.load(std::memory_order_relaxed));
+    command_stream_.reserve(std::max(new_size, command_stream_.capacity() * 2));
+  }
+  command_stream_.insert(command_stream_.end(), side_stream_.begin(), side_stream_.end());
+  side_stream_.clear();
 }
 
 void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
@@ -447,6 +464,15 @@ void DeferredCommandList::ExecuteRange(ID3D12GraphicsCommandList* command_list,
 void* DeferredCommandList::WriteCommand(Command command, size_t arguments_size_bytes) {
   size_t arguments_size_elements =
       (arguments_size_bytes + sizeof(uintmax_t) - 1) / sizeof(uintmax_t);
+  if (side_capture_) {
+    size_t side_offset = side_stream_.size();
+    side_stream_.resize(side_offset + kCommandHeaderSizeElements + arguments_size_elements);
+    CommandHeader& side_header =
+        *reinterpret_cast<CommandHeader*>(side_stream_.data() + side_offset);
+    side_header.command = command;
+    side_header.arguments_size_elements = uint32_t(arguments_size_elements);
+    return side_stream_.data() + (side_offset + kCommandHeaderSizeElements);
+  }
   size_t offset = command_stream_.size();
   size_t new_size = offset + kCommandHeaderSizeElements + arguments_size_elements;
   if (threaded_list_ != nullptr && new_size > command_stream_.capacity()) {

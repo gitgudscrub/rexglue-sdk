@@ -73,6 +73,14 @@ class DeferredCommandList {
   }
   void EndThreadedRecording();
 
+  // Side stream (Fable 2 fork): while capture is on, commands are written to a
+  // separate stream instead, which SpliceSide() later appends to the main one
+  // in a single block (the sun shadow map's redraws are batched this way, so
+  // the depth target is not switched back and forth for every draw).
+  void SetSideCapture(bool on) { side_capture_ = on; }
+  bool HasSide() const { return !side_stream_.empty(); }
+  void SpliceSide();
+
   D3D12_RECT* ClearDepthStencilViewAllocatedRects(D3D12_CPU_DESCRIPTOR_HANDLE depth_stencil_view,
                                                   D3D12_CLEAR_FLAGS clear_flags, FLOAT depth,
                                                   UINT8 stencil, UINT num_rects) {
@@ -690,6 +698,8 @@ class DeferredCommandList {
 
   // uintmax_t to ensure uint64_t and pointer alignment of all structures.
   std::vector<uintmax_t> command_stream_;
+  std::vector<uintmax_t> side_stream_;
+  bool side_capture_ = false;
 
   // Threaded recording. Positions are absolute (they never go back), in
   // uintmax_t elements: the stream offset of a command is its position minus

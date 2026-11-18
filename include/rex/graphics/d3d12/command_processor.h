@@ -801,6 +801,16 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t sun_map_frame_ = UINT64_MAX;        // frame something was drawn into it
   uint64_t sun_map_scene_depth_frame_ = UINT64_MAX;  // frame the scene depth was captured
   uint32_t sun_map_draws_ = 0;
+  // Batched sun map redraws (post_sun_map_batch): recorded into the command
+  // list's side stream with their own state, spliced in as one block.
+  bool sun_batch_open_ = false;
+  void* sun_batch_pipeline_ = nullptr;
+  ID3D12RootSignature* sun_batch_root_signature_ = nullptr;
+  D3D_PRIMITIVE_TOPOLOGY sun_batch_topology_ = D3D_PRIMITIVE_TOPOLOGY_UNDEFINED;
+  ID3D12DescriptorHeap* sun_batch_sampler_heap_ = nullptr;
+  D3D12_INDEX_BUFFER_VIEW sun_index_buffer_view_ = {};
+  bool sun_index_buffer_batchable_ = false;
+  void FlushSunMapBatch();
   bool sun_map_logged_ = false;
   // world -> sun map NDC (row-major) times the camera's clip -> world, the
   // map's centre / half size / half depth and the sun direction it was built

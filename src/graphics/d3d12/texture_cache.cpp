@@ -34,6 +34,13 @@
 #include <rex/math.h>
 #include <rex/ui/d3d12/d3d12_upload_buffer_pool.h>
 #include <rex/ui/d3d12/d3d12_util.h>
+#include <rex/cvar.h>
+
+REXCVAR_DEFINE_DOUBLE(texture_lod_bias, 0.0, "GPU/D3D12",
+                      "Mip level bias added to every game texture sampler (negative = sharper; "
+                      "Project Sparrow uses -0.5). Read when samplers are made (restart)")
+    .range(-2.0, 2.0)
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics::d3d12 {
 
@@ -1078,8 +1085,9 @@ void D3D12TextureCache::WriteSampler(SamplerParameters parameters,
   desc.AddressU = kAddressModeMap[uint32_t(parameters.clamp_x)];
   desc.AddressV = kAddressModeMap[uint32_t(parameters.clamp_y)];
   desc.AddressW = kAddressModeMap[uint32_t(parameters.clamp_z)];
-  // LOD biasing is performed in shaders.
-  desc.MipLODBias = 0.0f;
+  // LOD biasing is performed in shaders; texture_lod_bias (Project Sparrow's
+  // sharper textures) is added on top through the sampler.
+  desc.MipLODBias = float(REXCVAR_GET(texture_lod_bias));
   desc.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   switch (parameters.border_color) {
     case xenos::BorderColor::k_ABGR_White:

@@ -56,8 +56,10 @@ REXCVAR_DEFINE_DOUBLE(post_grade_contrast, 0.10, "GPU/D3D12", "Grade: contrast c
 REXCVAR_DEFINE_DOUBLE(post_grade_vibrance, 0.15, "GPU/D3D12", "Grade: muted-colour saturation")
     .range(-1.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
-REXCVAR_DEFINE_DOUBLE(post_grade_sharpen, 0.20, "GPU/D3D12", "Grade: 3x3 sharpen amount")
-    .range(0.0, 1.0)
+REXCVAR_DEFINE_DOUBLE(post_grade_sharpen, 0.20, "GPU/D3D12",
+                      "Grade: 3x3 sharpen amount; negative = contrast-adaptive sharpening "
+                      "(CAS) of that strength (Project Sparrow)")
+    .range(-1.0, 1.0)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_DOUBLE(post_grade_keep_exposure, 1.0, "GPU/D3D12",
                       "Grade: how much of the original average brightness is kept (0..1)")
@@ -232,6 +234,10 @@ REXCVAR_DEFINE_DOUBLE(post_bloom_strength, 0.3, "GPU/D3D12", "Bloom: glow amount
 REXCVAR_DEFINE_BOOL(post_aa, false, "GPU/D3D12",
                     "Modern-graphics anti-aliasing: FXAA on the colour grade's output (needs "
                     "post_grade)")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+REXCVAR_DEFINE_BOOL(post_smaa, false, "GPU/D3D12",
+                    "With post_aa: SMAA (sharper, cleaner edges) instead of FXAA (Project "
+                    "Sparrow)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_ao, false, "GPU/D3D12",
                     "Modern-graphics ambient occlusion from the game's scene depth, applied "
@@ -446,6 +452,13 @@ namespace shaders {
 #include "../shaders/bytecode/d3d12_5_1/post_grade_blur_v_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_down_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_grade_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_smaa_edges_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_smaa_weights_cs.h"
+#include "../shaders/bytecode/d3d12_5_1/post_smaa_blend_cs.h"
+namespace smaa_tables {
+#include "../shaders/smaa/AreaTex.h"
+#include "../shaders/smaa/SearchTex.h"
+}  // namespace smaa_tables
 #include "../shaders/bytecode/d3d12_5_1/post_grade_mean_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_bloom_down_cs.h"
 #include "../shaders/bytecode/d3d12_5_1/post_grade_bloom_blur_h_cs.h"
@@ -2135,6 +2148,13 @@ void D3D12CommandProcessor::ShutdownContext() {
   post_grade_shafts_coarse_pipeline_.Reset();
   post_grade_shafts_fine_pipeline_.Reset();
   post_grade_haze_pipeline_.Reset();
+  post_smaa_edges_pipeline_.Reset();
+  post_smaa_weights_pipeline_.Reset();
+  post_smaa_blend_pipeline_.Reset();
+  post_smaa_area_texture_.Reset();
+  post_smaa_search_texture_.Reset();
+  post_smaa_upload_buffer_.Reset();
+  post_smaa_tables_ready_ = false;
   post_grade_mean_pipeline_.Reset();
   post_grade_blur_v_pipeline_.Reset();
   post_grade_blur_h_pipeline_.Reset();
@@ -2759,9 +2779,9 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
           // down (t0 u0), blur_h (t1 u0), blur_v (t1 u0), mean (t1 u1),
           // grade (t0 t1 t2 u0).
           // d[13] bloom for the grade, d[14..23] bloom passes, d[24..25] FXAA,
-          // d[26] haze out, d[27] haze for the grade.
-          ui::d3d12::util::DescriptorCpuGpuHandlePair d[28];
-          if (!RequestOneUseSingleViewDescriptors(28, d)) {
+          // d[26] haze out, d[27] haze for the grade, d[28..35] SMAA.
+          ui::d3d12::util::DescriptorCpuGpuHandlePair d[36];
+          if (!RequestOneUseSingleViewDescriptors(36, d)) {
             // Show the ungraded frame.
             PushTransitionBarrier(apply_gamma_dest, apply_gamma_dest_initial_state,
                                   D3D12_RESOURCE_STATE_COPY_SOURCE);
@@ -3002,7 +3022,43 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
             table(PostGradeRootParameter::kHaze, d[27]);
             uint32_t full_groups_x = (guest_output_width + 15) / 16;
             uint32_t full_groups_y = (guest_output_height + 7) / 8;
-            if (use_post_aa) {
+            bool use_smaa = use_post_aa && REXCVAR_GET(post_smaa) && post_smaa_blend_pipeline_ &&
+                            post_smaa_edges_texture_ && EnsureSmaaTables();
+            if (use_smaa) {
+              pass(post_grade_grade_pipeline_.Get(), fxaa_source_texture_.Get(), kRead,
+                   full_groups_x, full_groups_y);
+              fxaa_source_texture_submission_ = submission_current_;
+              // SMAA: edges (colour), blend weights (edges + tables), then
+              // the neighbourhood blend into the guest output.
+              ID3D12Resource* edges = post_smaa_edges_texture_.Get();
+              ID3D12Resource* weights = post_smaa_weights_texture_.Get();
+              uav(edges, DXGI_FORMAT_R8G8_UNORM, d[28].first);
+              srv(edges, DXGI_FORMAT_R8G8_UNORM, d[29].first);
+              srv(post_smaa_area_texture_.Get(), DXGI_FORMAT_R8G8_UNORM, d[30].first);
+              srv(post_smaa_search_texture_.Get(), DXGI_FORMAT_R8_UNORM, d[31].first);
+              uav(weights, DXGI_FORMAT_R8G8B8A8_UNORM, d[32].first);
+              srv(weights, DXGI_FORMAT_R8G8B8A8_UNORM, d[33].first);
+              srv(fxaa_source_texture_.Get(), kFxaaSourceTextureFormat, d[34].first);
+              uav(guest_output_resource, ui::d3d12::D3D12Presenter::kGuestOutputFormat,
+                  d[35].first);
+              uint32_t smaa_groups_x = (guest_output_width + 7) / 8;
+              uint32_t smaa_groups_y = (guest_output_height + 7) / 8;
+              table(PostGradeRootParameter::kSource, d[34]);
+              table(PostGradeRootParameter::kDestination, d[28]);
+              pass(post_smaa_edges_pipeline_.Get(), edges, kRead, smaa_groups_x, smaa_groups_y);
+              table(PostGradeRootParameter::kSource, d[29]);
+              table(PostGradeRootParameter::kLuma, d[30]);
+              table(PostGradeRootParameter::kMean, d[31]);
+              table(PostGradeRootParameter::kDestination, d[32]);
+              pass(post_smaa_weights_pipeline_.Get(), weights, kRead, smaa_groups_x,
+                   smaa_groups_y);
+              table(PostGradeRootParameter::kSource, d[34]);
+              table(PostGradeRootParameter::kLuma, d[33]);
+              table(PostGradeRootParameter::kDestination, d[35]);
+              pass(post_smaa_blend_pipeline_.Get(), guest_output_resource,
+                   ui::d3d12::D3D12Presenter::kGuestOutputInternalState, smaa_groups_x,
+                   smaa_groups_y);
+            } else if (use_post_aa) {
               pass(post_grade_grade_pipeline_.Get(), fxaa_source_texture_.Get(), kRead,
                    full_groups_x, full_groups_y);
               fxaa_source_texture_submission_ = submission_current_;
@@ -3096,11 +3152,15 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_NEVER;
   sampler.ShaderRegister = 0;
   sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+  // s1: point (SMAA reads its edges and lookup tables unfiltered).
+  D3D12_STATIC_SAMPLER_DESC samplers[2] = {sampler, sampler};
+  samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
+  samplers[1].ShaderRegister = 1;
   D3D12_ROOT_SIGNATURE_DESC desc;
   desc.NumParameters = UINT(PostGradeRootParameter::kCount);
   desc.pParameters = parameters;
-  desc.NumStaticSamplers = 1;
-  desc.pStaticSamplers = &sampler;
+  desc.NumStaticSamplers = 2;
+  desc.pStaticSamplers = samplers;
   desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
   *(post_grade_root_signature_.ReleaseAndGetAddressOf()) =
       ui::d3d12::util::CreateRootSignature(provider, desc);
@@ -3124,6 +3184,9 @@ bool D3D12CommandProcessor::InitializePostGrade() {
   REX_POST_GRADE_PIPELINE(post_grade_shafts_coarse_pipeline_, post_grade_shafts_coarse_cs)
   REX_POST_GRADE_PIPELINE(post_grade_shafts_fine_pipeline_, post_grade_shafts_fine_cs)
   REX_POST_GRADE_PIPELINE(post_grade_haze_pipeline_, post_grade_haze_cs)
+  REX_POST_GRADE_PIPELINE(post_smaa_edges_pipeline_, post_smaa_edges_cs)
+  REX_POST_GRADE_PIPELINE(post_smaa_weights_pipeline_, post_smaa_weights_cs)
+  REX_POST_GRADE_PIPELINE(post_smaa_blend_pipeline_, post_smaa_blend_cs)
   REX_POST_GRADE_PIPELINE(post_ao_pipeline_, post_ao_ao_cs)
   REX_POST_GRADE_PIPELINE(post_ao_ms_pipeline_, post_ao_ao_ms_cs)
   REX_POST_GRADE_PIPELINE(post_ao_blur_h_pipeline_, post_ao_blur_h_cs)
@@ -3145,7 +3208,9 @@ void D3D12CommandProcessor::ReleasePostGradeTextures() {
                                 post_grade_luma_textures_[1].Get(), post_grade_mean_texture_.Get(),
                                 post_grade_haze_texture_.Get(),
                                 post_grade_bloom_textures_[0].Get(),
-                                post_grade_bloom_textures_[1].Get()};
+                                post_grade_bloom_textures_[1].Get(),
+                                post_smaa_edges_texture_.Get(),
+                                post_smaa_weights_texture_.Get()};
   for (ID3D12Resource* texture : textures) {
     if (texture && submission_completed_ < post_grade_submission_) {
       texture->AddRef();
@@ -3159,7 +3224,102 @@ void D3D12CommandProcessor::ReleasePostGradeTextures() {
   post_grade_haze_texture_.Reset();
   post_grade_bloom_textures_[0].Reset();
   post_grade_bloom_textures_[1].Reset();
+  post_smaa_edges_texture_.Reset();
+  post_smaa_weights_texture_.Reset();
   post_grade_mean_valid_ = false;
+}
+
+// SMAA's area (160x560 RG8) and search (64x16 R8) tables, uploaded once on
+// the deferred command list; false (and SMAA falls back to FXAA) on failure.
+bool D3D12CommandProcessor::EnsureSmaaTables() {
+  if (post_smaa_tables_ready_) return true;
+  if (post_smaa_tables_failed_) return false;
+  post_smaa_tables_failed_ = true;
+  const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
+  ID3D12Device* device = provider.GetDevice();
+  struct Table {
+    const unsigned char* bytes;
+    uint32_t width, height, texel_bytes;
+    DXGI_FORMAT format;
+    Microsoft::WRL::ComPtr<ID3D12Resource>* texture;
+  } tables[2] = {
+      {shaders::smaa_tables::areaTexBytes, AREATEX_WIDTH, AREATEX_HEIGHT, 2, DXGI_FORMAT_R8G8_UNORM,
+       &post_smaa_area_texture_},
+      {shaders::smaa_tables::searchTexBytes, SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT, 1, DXGI_FORMAT_R8_UNORM,
+       &post_smaa_search_texture_}};
+  uint32_t offsets[2], pitches[2], total = 0;
+  for (int i = 0; i < 2; ++i) {
+    pitches[i] = (tables[i].width * tables[i].texel_bytes + D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1) &
+                 ~uint32_t(D3D12_TEXTURE_DATA_PITCH_ALIGNMENT - 1);
+    total = (total + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1) &
+            ~uint32_t(D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT - 1);
+    offsets[i] = total;
+    total += pitches[i] * tables[i].height;
+  }
+  D3D12_RESOURCE_DESC buffer_desc = {};
+  buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  buffer_desc.Width = total;
+  buffer_desc.Height = 1;
+  buffer_desc.DepthOrArraySize = 1;
+  buffer_desc.MipLevels = 1;
+  buffer_desc.SampleDesc.Count = 1;
+  buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  if (FAILED(device->CreateCommittedResource(&ui::d3d12::util::kHeapPropertiesUpload,
+                                             D3D12_HEAP_FLAG_NONE, &buffer_desc,
+                                             D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                             IID_PPV_ARGS(&post_smaa_upload_buffer_)))) {
+    REXGPU_ERROR("SMAA: failed to create the table upload buffer");
+    return false;
+  }
+  uint8_t* mapping;
+  D3D12_RANGE no_read = {};
+  if (FAILED(post_smaa_upload_buffer_->Map(0, &no_read, reinterpret_cast<void**>(&mapping)))) {
+    REXGPU_ERROR("SMAA: failed to map the table upload buffer");
+    return false;
+  }
+  for (int i = 0; i < 2; ++i) {
+    uint32_t row = tables[i].width * tables[i].texel_bytes;
+    for (uint32_t y = 0; y < tables[i].height; ++y) {
+      std::memcpy(mapping + offsets[i] + y * pitches[i], tables[i].bytes + y * row, row);
+    }
+  }
+  post_smaa_upload_buffer_->Unmap(0, nullptr);
+  for (int i = 0; i < 2; ++i) {
+    D3D12_RESOURCE_DESC desc = {};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = tables[i].width;
+    desc.Height = tables[i].height;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = tables[i].format;
+    desc.SampleDesc.Count = 1;
+    if (FAILED(device->CreateCommittedResource(
+            &ui::d3d12::util::kHeapPropertiesDefault, D3D12_HEAP_FLAG_NONE, &desc,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(tables[i].texture->ReleaseAndGetAddressOf())))) {
+      REXGPU_ERROR("SMAA: failed to create a lookup table");
+      return false;
+    }
+    D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+    dst.pResource = tables[i].texture->Get();
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    dst.SubresourceIndex = 0;
+    src.pResource = post_smaa_upload_buffer_.Get();
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Offset = offsets[i];
+    src.PlacedFootprint.Footprint.Format = tables[i].format;
+    src.PlacedFootprint.Footprint.Width = tables[i].width;
+    src.PlacedFootprint.Footprint.Height = tables[i].height;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = pitches[i];
+    SubmitBarriers();
+    deferred_command_list_.D3DCopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    PushTransitionBarrier(tables[i].texture->Get(), D3D12_RESOURCE_STATE_COPY_DEST,
+                          D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+  }
+  post_smaa_tables_failed_ = false;
+  post_smaa_tables_ready_ = true;
+  REXGPU_INFO("SMAA: lookup tables uploaded");
+  return true;
 }
 
 bool D3D12CommandProcessor::EnsurePostGradeTextures(uint32_t width, uint32_t height) {
@@ -3197,7 +3357,9 @@ bool D3D12CommandProcessor::EnsurePostGradeTextures(uint32_t width, uint32_t hei
       !create(small_width, small_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
               post_grade_bloom_textures_[0]) ||
       !create(small_width, small_height, DXGI_FORMAT_R16G16B16A16_FLOAT,
-              post_grade_bloom_textures_[1])) {
+              post_grade_bloom_textures_[1]) ||
+      !create(width, height, DXGI_FORMAT_R8G8_UNORM, post_smaa_edges_texture_) ||
+      !create(width, height, DXGI_FORMAT_R8G8B8A8_UNORM, post_smaa_weights_texture_)) {
     REXGPU_ERROR("Failed to create the colour grade textures");
     ReleasePostGradeTextures();
     return false;

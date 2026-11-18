@@ -725,6 +725,19 @@ class D3D12CommandProcessor : public CommandProcessor {
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_shafts_coarse_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_shafts_fine_pipeline_;
   Microsoft::WRL::ComPtr<ID3D12PipelineState> post_grade_haze_pipeline_;
+  // SMAA (post_smaa, post_smaa.cs.hlsl) in place of the grade's FXAA.
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_smaa_edges_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_smaa_weights_pipeline_;
+  Microsoft::WRL::ComPtr<ID3D12PipelineState> post_smaa_blend_pipeline_;
+  // Its lookup tables (uploaded once) and per-size edges / weights.
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_smaa_area_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_smaa_search_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_smaa_upload_buffer_;
+  bool post_smaa_tables_ready_ = false;
+  bool post_smaa_tables_failed_ = false;
+  bool EnsureSmaaTables();
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_smaa_edges_texture_;
+  Microsoft::WRL::ComPtr<ID3D12Resource> post_smaa_weights_texture_;
   // All kept in NON_PIXEL_SHADER_RESOURCE between passes and frames.
   // Full-res copy of the gamma-corrected frame (kFxaaSourceTextureFormat).
   Microsoft::WRL::ComPtr<ID3D12Resource> post_grade_source_texture_;

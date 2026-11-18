@@ -40,7 +40,7 @@ cbuffer PostGradeConstants : register(b0) {
   float clarity;      // local contrast amount
   float contrast;     // S-curve amount (0..1)
   float vibrance;     // muted-colour saturation boost
-  float sharpen;      // 3x3 unsharp amount
+  float sharpen;      // 3x3 unsharp amount; negative: CAS of strength -sharpen
   float keep_exposure;  // 0..1, how much the average brightness is restored
   float mean_blend;   // per-frame blend of the brightness average (0..1)
   uint pass_param;    // blur: unused; mean: first frame flag
@@ -330,7 +330,26 @@ void grade(uint3 id : SV_DispatchThreadID) {
   int2 hi = int2(size) - 1;
   float3 c = source[p].rgb;
   // 3x3 unsharp on the input (before grading keeps it one pass).
-  if (sharpen > 0.0) {
+  if (sharpen < 0.0) {
+    // Contrast-adaptive sharpening (after AMD FidelityFX CAS): the cross's
+    // weight follows how much headroom the 3x3 neighbourhood leaves, so
+    // soft detail sharpens and edges that are already crisp do not ring.
+    float3 a = source[clamp(p + int2(-1, -1), int2(0, 0), hi)].rgb;
+    float3 b = source[clamp(p + int2(0, -1), int2(0, 0), hi)].rgb;
+    float3 cc = source[clamp(p + int2(1, -1), int2(0, 0), hi)].rgb;
+    float3 d = source[clamp(p + int2(-1, 0), int2(0, 0), hi)].rgb;
+    float3 f = source[clamp(p + int2(1, 0), int2(0, 0), hi)].rgb;
+    float3 g = source[clamp(p + int2(-1, 1), int2(0, 0), hi)].rgb;
+    float3 h = source[clamp(p + int2(0, 1), int2(0, 0), hi)].rgb;
+    float3 i = source[clamp(p + int2(1, 1), int2(0, 0), hi)].rgb;
+    float3 mn = min(min(min(d, c), min(f, b)), h);
+    float3 mx = max(max(max(d, c), max(f, b)), h);
+    mn += min(mn, min(min(a, cc), min(g, i)));
+    mx += max(mx, max(max(a, cc), max(g, i)));
+    float3 amp = sqrt(saturate(min(mn, 2.0 - mx) / max(mx, 1e-5)));
+    float3 w = amp * (-1.0 / lerp(8.0, 5.0, saturate(-sharpen)));
+    c = saturate(((b + d + f + h) * w + c) / (1.0 + 4.0 * w));
+  } else if (sharpen > 0.0) {
     float3 sum = 0.0;
     for (int y = -1; y <= 1; ++y) {
       for (int x = -1; x <= 1; ++x) {

@@ -104,6 +104,8 @@ EXPORTS
 ?GetLoggerRaw@rex@@YAPEAVlogger@spdlog@@ULogCategoryId@1@@Z
 ?GetPackedMipOffset@texture_util@graphics@rex@@YA_NIIIW4TextureFormat@xenos@23@IAEAI11@Z
 ?GetSnapshotCounter@perf@rex@@YA_JW4CounterId@12@@Z
+?HideNotice@ui@rex@@YAXXZ
+?InstallNoticeOverlay@ui@rex@@YAXPEAVImGuiDrawer@12@V?$function@$$A6AXV?$function@$$A6AXXZ@std@@@Z@std@@@Z
 ?SetCounter@perf@rex@@YAXW4CounterId@12@_J@Z
 ?ResetFrameCounters@perf@rex@@YAXXZ
 ?GetSubresourcesFromFetchConstant@texture_util@graphics@rex@@YAXAEBTxe_gpu_texture_fetch_t@xenos@23@PEAI111111@Z
@@ -183,6 +185,7 @@ EXPORTS
 ?SetTitle@Window@ui@rex@@QEAAXV?$basic_string_view@DU?$char_traits@D@std@@@std@@@Z
 ?SetIcon@Window@ui@rex@@QEAAXPEBX_K@Z
 ?Setup@Runtime@rex@@QEAAIAEBUPPCImageInfo@2@URuntimeConfig@2@@Z
+?ShowNotice@ui@rex@@YAXW4NoticeKind@12@V?$basic_string@DU?$char_traits@D@std@@V?$allocator@D@2@@std@@11M@Z
 ?ShowSimpleMessageBox@rex@@YAXW4SimpleMessageBoxType@1@V?$basic_string_view@DU?$char_traits@D@std@@@std@@@Z
 ?Sleep@thread@rex@@YAXV?$duration@_JU?$ratio@$00$0PECEA@@std@@@chrono@std@@@Z
 ?SwizzleSigns@texture_util@graphics@rex@@YAEAEBTxe_gpu_texture_fetch_t@xenos@23@@Z

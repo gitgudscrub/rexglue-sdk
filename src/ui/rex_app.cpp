@@ -25,6 +25,7 @@
 #include <rex/ui/overlay/achievement_toast.h>
 #include <rex/ui/overlay/achievements_overlay.h>
 #include <rex/ui/overlay/console_overlay.h>
+#include <rex/ui/overlay/notice.h>
 #include <rex/ui/overlay/debug_overlay.h>
 #include <rex/ui/overlay/settings_overlay.h>
 #include <rex/audio/audio_system.h>
@@ -451,6 +452,9 @@ void ReXApp::SetupOverlays(rex::ui::Presenter* presenter, rex::ui::ImmediateDraw
     }
   });
 
+  ui::InstallNoticeOverlay(imgui_drawer_.get(), [this](std::function<void()> fn) {
+    app_context().CallInUIThread(std::move(fn));
+  });
   OnCreateDialogs(imgui_drawer_.get());
 }
 

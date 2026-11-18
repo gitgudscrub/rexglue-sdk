@@ -24,6 +24,7 @@ set(REXUI_CORE_SOURCES
 set(REXUI_OVERLAY_SOURCES
     overlay/achievement_icon_cache.cpp
     overlay/achievement_toast.cpp
+    overlay/notice.cpp
     overlay/achievements_overlay.cpp
     overlay/debug_overlay.cpp
     overlay/console_overlay.cpp

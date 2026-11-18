@@ -308,8 +308,10 @@ REXCVAR_DEFINE_INT32(sparrow_debug, 0, "GPU/D3D12",
                      "leather, cyan metal, magenta gloss); 5 = lamp shadows alone (white lit, "
                      "black shadowed); 6 = no lamp shadows (A/B); 7 = whether each "
                      "pixel is in the depth copy (green yes, red no); 8 = reflections alone; 9 = "
-                     "no reflections (A/B); 10 = wet ground mask (blue puddles, cyan film)")
-    .range(0, 10)
+                     "no reflections (A/B); 10 = wet ground mask (blue puddles, cyan film); 11 = no "
+                     "surface relief (A/B); 12 = relief height (grey) and its sun shadow "
+                     "(magenta)")
+    .range(0, 12)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 REXCVAR_DEFINE_BOOL(post_sun_map, false, "GPU/D3D12",
                     "Sun shadows from a real shadow map (needs post_sun_shadows): the game's "
